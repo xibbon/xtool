@@ -44,7 +44,7 @@ public struct AutoSigner {
 
     public func sign(
         app: URL,
-        status: @escaping (String) -> Void,
+        status: @escaping @Sendable (String) -> Void,
         progress: @escaping @Sendable (Double?) -> Void,
         didProvision: @escaping () throws -> Void = {}
     ) async throws -> String {
@@ -53,7 +53,8 @@ public struct AutoSigner {
             context: context,
             app: app,
             confirmRevocation: confirmRevocation,
-            progress: progress
+            progress: progress,
+            status: status
         ).perform()
 
         let provisioningDict = response.provisioningDict
@@ -65,7 +66,14 @@ public struct AutoSigner {
         try didProvision()
 
         for (url, info) in provisioningDict {
-            let infoPlist = url.appendingPathComponent("Info.plist")
+            let platform = ProvisioningPlatform(appBundleURL: url)
+            let infoPlist: URL
+            switch platform {
+            case .iOS:
+                infoPlist = url.appendingPathComponent("Info.plist")
+            case .macOS:
+                infoPlist = url.appendingPathComponent("Contents").appendingPathComponent("Info.plist")
+            }
             guard let data = try? Data(contentsOf: infoPlist),
                 let dict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
                 else { throw Error.errorReading(infoPlist.lastPathComponent) }
@@ -75,14 +83,26 @@ public struct AutoSigner {
                 throw Error.errorWriting(infoPlist.lastPathComponent)
             }
 
-            let profURL = url.appendingPathComponent("embedded.mobileprovision")
-            if profURL.exists {
-                try FileManager.default.removeItem(at: profURL)
+            let mobileProvisionURL = url.appendingPathComponent("embedded.mobileprovision")
+            if mobileProvisionURL.exists {
+                try FileManager.default.removeItem(at: mobileProvisionURL)
             }
-            try info.mobileprovision.data().write(to: profURL)
+            let macProvisionURL = url
+                .appendingPathComponent("Contents")
+                .appendingPathComponent("embedded.provisionprofile")
+            if macProvisionURL.exists {
+                try FileManager.default.removeItem(at: macProvisionURL)
+            }
+
+            let profileURL = url.appendingPathComponent(platform.embeddedProvisioningProfileRelativePath)
+            try FileManager.default.createDirectory(
+                at: profileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try info.mobileprovision.data().write(to: profileURL)
         }
 
-        let entitlements = provisioningDict.mapValues(\.entitlements)
+        let entitlements = provisioningDict.mapValues { $0.entitlements }
 
         status(NSLocalizedString("signer.signing", value: "Signing", comment: ""))
         try await context.signer.sign(

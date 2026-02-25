@@ -31,10 +31,36 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
     public let context: SigningContext
     public let signingInfo: SigningInfo
     public let root: URL
-    public init(context: SigningContext, signingInfo: SigningInfo, root: URL) {
+    public let platform: ProvisioningPlatform
+    public init(
+        context: SigningContext,
+        signingInfo: SigningInfo,
+        root: URL,
+        platform: ProvisioningPlatform = .iOS
+    ) {
         self.context = context
         self.signingInfo = signingInfo
         self.root = root
+        self.platform = platform
+    }
+
+    private func infoPlistURL(for app: URL) -> URL {
+        let macInfoPlist = app.appendingPathComponent("Contents").appendingPathComponent("Info.plist")
+        if FileManager.default.fileExists(atPath: macInfoPlist.path) {
+            return macInfoPlist
+        }
+        return app.appendingPathComponent("Info.plist")
+    }
+
+    private func executableURL(for app: URL, executableName: String) -> URL {
+        let macExecutable = app
+            .appendingPathComponent("Contents")
+            .appendingPathComponent("MacOS")
+            .appendingPathComponent(executableName)
+        if FileManager.default.fileExists(atPath: macExecutable.path) {
+            return macExecutable
+        }
+        return app.appendingPathComponent(executableName)
     }
 
     /// Registers the app with the given entitlements
@@ -44,6 +70,7 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
         isFreeTeam: Bool
     ) async throws -> Components.Schemas.BundleId {
         let newBundleID = ProvisioningIdentifiers.identifier(fromSanitized: bundleID, context: self.context)
+        let expectedPlatform = platform.bundleIDPlatform
 
         let existing = try await context.developerAPIClient
             .bundleIdsGetCollection(query: .init(
@@ -51,7 +78,22 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
             ))
             .ok.body.json.data
             // filter[identifier] is a prefix filter so we need to manually upgrade to equality
-            .first(where: { $0.attributes?.identifier == newBundleID })
+            .first(where: { candidate in
+                guard candidate.attributes?.identifier == newBundleID else {
+                    return false
+                }
+                guard let platformValue = candidate.attributes?.platform?.value1 else {
+                    return true
+                }
+                switch expectedPlatform {
+                case .ios:
+                    return platformValue == .ios || platformValue == .universal
+                case .macOs:
+                    return platformValue == .macOs || platformValue == .universal
+                case .universal:
+                    return true
+                }
+            })
 
         let appID: Components.Schemas.BundleId
         if let existing {
@@ -65,7 +107,7 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
                             _type: .bundleIds,
                             attributes: .init(
                                 name: name,
-                                platform: .init(.ios),
+                                platform: .init(platform.bundleIDPlatform),
                                 identifier: newBundleID
                             )
                         )
@@ -160,14 +202,14 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
         _ app: URL,
         isFreeTeam: Bool
     ) async throws -> ProvisioningInfo {
-        let infoURL = app.appendingPathComponent("Info.plist")
+        let infoURL = infoPlistURL(for: app)
         guard let data = try? Data(contentsOf: infoURL),
             let dict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
             let bundleID = dict["CFBundleIdentifier"] as? String,
             let executable = dict["CFBundleExecutable"] as? String else {
             throw Error.invalidApp(app)
         }
-        let executableURL = app.appendingPathComponent(executable)
+        let executableURL = executableURL(for: app, executableName: executable)
 
         var entitlements: Entitlements
         // if the executable doesn't already have entitlements, that's
@@ -211,7 +253,8 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
             if let operation = DeveloperServicesAssignAppGroupsOperation(
                 context: self.context,
                 groupIDs: groups,
-                appID: appID
+                appID: appID,
+                platform: platform
             ) {
                 let newGroups = try await operation.perform()
                 entitlementsArray[groupsIdx] = AppGroupEntitlement(rawValue: newGroups)
@@ -222,7 +265,8 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
         let mobileprovision = try await DeveloperServicesFetchProfileOperation(
             context: self.context,
             bundleID: newBundleID,
-            signingInfo: signingInfo
+            signingInfo: signingInfo,
+            platform: platform
         ).perform()
 
         return ProvisioningInfo(
@@ -236,7 +280,7 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
     public func perform() async throws -> [URL: ProvisioningInfo] {
         var apps: [URL] = [root]
 
-        for pluginsDir in ["PlugIns", "Extensions"] {
+        for pluginsDir in ["PlugIns", "Extensions", "Contents/PlugIns", "Contents/Extensions"] {
             let plugins = root.appendingPathComponent(pluginsDir)
             guard plugins.dirExists else { continue }
             apps += plugins.implicitContents.filter { $0.pathExtension.lowercased() == "appex" }

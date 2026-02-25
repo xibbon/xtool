@@ -9,6 +9,7 @@ struct DSDevicesCommand: AsyncParsableCommand {
         abstract: "Interact with devices",
         subcommands: [
             DSDevicesListCommand.self,
+            DSDevicesRegisterThisMacCommand.self,
         ],
         defaultSubcommand: DSDevicesListCommand.self
     )
@@ -65,5 +66,26 @@ struct DSDevicesListCommand: AsyncParsableCommand {
                 print("  added date: \(addedDate.formatted(.dateTime))")
             }
         }
+    }
+}
+
+struct DSDevicesRegisterThisMacCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "register-this-mac",
+        abstract: "Register the current Mac for Developer Services provisioning"
+    )
+
+    func run() async throws {
+        #if os(macOS)
+        let auth = try AuthToken.saved().authData()
+        let context = try SigningContext(auth: auth)
+        try await DeveloperServicesAddDeviceOperation(
+            context: context,
+            platform: .macOS
+        ).perform()
+        print("Current Mac is available for macOS provisioning.")
+        #else
+        throw Console.Error("This command is only available on macOS.")
+        #endif
     }
 }

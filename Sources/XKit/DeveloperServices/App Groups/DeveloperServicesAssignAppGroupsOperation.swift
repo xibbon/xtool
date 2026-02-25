@@ -15,17 +15,20 @@ public struct DeveloperServicesAssignAppGroupsOperation: DeveloperServicesOperat
     public let groupIDs: [DeveloperServicesAppGroup.GroupID]
     public let appID: Components.Schemas.BundleId
     public let xcodeAuthData: XcodeAuthData
+    public let platform: DeveloperServicesPlatform
 
     private let client: DeveloperServicesClient
 
     public init?(
         context: SigningContext,
         groupIDs: [DeveloperServicesAppGroup.GroupID],
-        appID: Components.Schemas.BundleId
+        appID: Components.Schemas.BundleId,
+        platform: ProvisioningPlatform = .iOS
     ) {
         self.context = context
         self.groupIDs = groupIDs
         self.appID = appID
+        self.platform = platform.developerServicesPlatform
 
         guard case .xcode(let authData) = context.auth else { return nil }
         self.xcodeAuthData = authData
@@ -45,7 +48,7 @@ public struct DeveloperServicesAssignAppGroupsOperation: DeveloperServicesOperat
             let groupID = ProvisioningIdentifiers.groupID(fromSanitized: sanitized, context: context)
             let name = ProvisioningIdentifiers.groupName(fromSanitized: sanitized)
             let request = DeveloperServicesAddAppGroupRequest(
-                platform: .iOS,
+                platform: platform,
                 teamID: xcodeAuthData.teamID,
                 name: name,
                 groupID: groupID
@@ -55,7 +58,7 @@ public struct DeveloperServicesAssignAppGroupsOperation: DeveloperServicesOperat
 
         _ = try await client.send(
             DeveloperServicesAssignAppGroupRequest(
-                platform: .iOS,
+                platform: platform,
                 teamID: xcodeAuthData.teamID,
                 appIDID: appID.id,
                 groupID: group.id
@@ -67,7 +70,7 @@ public struct DeveloperServicesAssignAppGroupsOperation: DeveloperServicesOperat
 
     public func perform() async throws -> [DeveloperServicesAppGroup.GroupID] {
         let existing = try await client.send(DeveloperServicesListAppGroupsRequest(
-            platform: .iOS, teamID: xcodeAuthData.teamID
+            platform: platform, teamID: xcodeAuthData.teamID
         ))
         let sanitized = existing.map { (ProvisioningIdentifiers.sanitize(groupID: $0.groupID), $0) }
         let dict = Dictionary(sanitized, uniquingKeysWith: { $1 })
