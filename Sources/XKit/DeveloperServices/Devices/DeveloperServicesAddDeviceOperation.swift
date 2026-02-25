@@ -138,9 +138,43 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
 
     #if os(macOS)
     private func currentMacTargetDevice() throws -> SigningContext.TargetDevice {
-        let udid = try currentMacHardwareUUID()
+        let udid = try currentMacProvisioningUDID()
         let name = Host.current().localizedName ?? "This Mac"
         return .init(udid: udid, name: name)
+    }
+
+    private func currentMacProvisioningUDID() throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+        process.arguments = ["SPHardwareDataType"]
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        try process.run()
+        process.waitUntilExit()
+
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: outputData, encoding: .utf8) ?? ""
+
+        guard process.terminationStatus == 0 else {
+            throw CocoaError(.executableLoad)
+        }
+
+        let marker = "Provisioning UDID:"
+        if let markerRange = output.range(of: marker) {
+            let suffix = output[markerRange.upperBound...]
+            let udid = suffix
+                .prefix { $0 != "\n" && $0 != "\r" }
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !udid.isEmpty {
+                return udid.uppercased()
+            }
+        }
+
+        // Fallback for environments where system_profiler does not report a provisioning UDID.
+        return try currentMacHardwareUUID()
     }
 
     private func currentMacHardwareUUID() throws -> String {

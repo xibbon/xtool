@@ -14,9 +14,11 @@ import ProtoCodable
 extension EntitlementContainer {
     public static let supportedTypes: [ProtoCodable.Type] = [
         ApplicationIdentifierEntitlement.self,
+        MacApplicationIdentifierEntitlement.self,
         TeamIdentifierEntitlement.self,
         KeychainAccessGroupsEntitlement.self,
         GetTaskAllowEntitlement.self,
+        MacGetTaskAllowEntitlement.self,
 //        AssociatedDomainsEntitlement.self,
         APSEnvironmentEntitlement.self,
         AppGroupEntitlement.self,
@@ -33,6 +35,13 @@ extension EntitlementContainer {
 
 public struct ApplicationIdentifierEntitlement: Entitlement, RawRepresentable {
     public static let identifier = "application-identifier"
+
+    public var rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+}
+
+public struct MacApplicationIdentifierEntitlement: Entitlement, RawRepresentable {
+    public static let identifier = "com.apple.application-identifier"
 
     public var rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }
@@ -78,6 +87,13 @@ public struct AppGroupEntitlement: Entitlement, RawRepresentable {
 
 public struct GetTaskAllowEntitlement: Entitlement, RawRepresentable {
     public static let identifier = "get-task-allow"
+
+    public var rawValue: Bool
+    public init(rawValue: Bool) { self.rawValue = rawValue }
+}
+
+public struct MacGetTaskAllowEntitlement: Entitlement, RawRepresentable {
+    public static let identifier = "com.apple.security.get-task-allow"
 
     public var rawValue: Bool
     public init(rawValue: Bool) { self.rawValue = rawValue }

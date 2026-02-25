@@ -237,11 +237,28 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
             bundleID: newBundleID
         )
         // set get-task-allow to YES, required for dev certs
-        try entitlements.updateEntitlements { ents in
-            if let getTaskAllow = ents.firstIndex(where: { $0 is GetTaskAllowEntitlement }) {
-                ents[getTaskAllow] = GetTaskAllowEntitlement(rawValue: true)
-            } else {
-                ents.append(GetTaskAllowEntitlement(rawValue: true))
+        if platform == .macOS {
+            // macOS expects `com.apple.application-identifier` and
+            // `com.apple.security.get-task-allow` in the app entitlements.
+            try entitlements.updateEntitlements { ents in
+                ents.removeAll {
+                    $0 is ApplicationIdentifierEntitlement
+                        || $0 is MacApplicationIdentifierEntitlement
+                        || $0 is GetTaskAllowEntitlement
+                        || $0 is MacGetTaskAllowEntitlement
+                        || $0 is KeychainAccessGroupsEntitlement
+                }
+                ents.append(MacApplicationIdentifierEntitlement(rawValue: "\(teamID).\(newBundleID)"))
+                ents.append(MacGetTaskAllowEntitlement(rawValue: true))
+                ents.append(KeychainAccessGroupsEntitlement(rawValue: ["\(teamID).*"]))
+            }
+        } else {
+            try entitlements.updateEntitlements { ents in
+                if let getTaskAllow = ents.firstIndex(where: { $0 is GetTaskAllowEntitlement }) {
+                    ents[getTaskAllow] = GetTaskAllowEntitlement(rawValue: true)
+                } else {
+                    ents.append(GetTaskAllowEntitlement(rawValue: true))
+                }
             }
         }
 

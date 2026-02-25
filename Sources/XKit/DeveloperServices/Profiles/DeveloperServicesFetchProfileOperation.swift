@@ -184,7 +184,7 @@ public struct DeveloperServicesFetchProfileOperation: DeveloperServicesOperation
             return context.targetDevice?.udid.uppercased()
         case .macOS:
             #if os(macOS)
-            return try currentMacHardwareUUID()
+            return try currentMacProvisioningUDID()
             #else
             return nil
             #endif
@@ -192,6 +192,39 @@ public struct DeveloperServicesFetchProfileOperation: DeveloperServicesOperation
     }
 
     #if os(macOS)
+    private func currentMacProvisioningUDID() throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+        process.arguments = ["SPHardwareDataType"]
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        try process.run()
+        process.waitUntilExit()
+
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: outputData, encoding: .utf8) ?? ""
+
+        guard process.terminationStatus == 0 else {
+            throw CocoaError(.executableLoad)
+        }
+
+        let marker = "Provisioning UDID:"
+        if let markerRange = output.range(of: marker) {
+            let suffix = output[markerRange.upperBound...]
+            let udid = suffix
+                .prefix { $0 != "\n" && $0 != "\r" }
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !udid.isEmpty {
+                return udid.uppercased()
+            }
+        }
+
+        return try currentMacHardwareUUID()
+    }
+
     private func currentMacHardwareUUID() throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
