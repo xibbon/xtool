@@ -109,6 +109,8 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
 
     private static let baseURL = URL(string: "https://developerservices2.apple.com/services")!
     private static let queryEncoder = JSONEncoder()
+    private static let retryAttempts = 3
+    private static let retryDelayNanoseconds: UInt64 = 400_000_000
 
     public func intercept(
         _ request: HTTPRequest,
@@ -122,6 +124,7 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
         ) async throws -> (HTTPResponse, HTTPBody?)
     ) async throws -> (HTTPResponse, HTTPBody?) {
         var request = request
+        var requestBodyData: Data?
 
         let deviceInfo = try deviceInfoProvider.fetch()
 
@@ -147,13 +150,14 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
         request.headerFields[.init("X-Apple-GS-Token")!] = authData.loginToken.token
 
         // Anisette
-        let anisetteData = try await anisetteDataProvider.fetchAnisetteData()
+        let anisetteData = try await retrying {
+            try await anisetteDataProvider.fetchAnisetteData()
+        }
         for (key, value) in anisetteData.dictionary {
             request.headerFields[.init(key)!] = value
         }
 
         // Body
-        var body = body
         let originalMethod = request.method
         switch originalMethod {
         case .get, .delete:
@@ -174,8 +178,9 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
             components.query = nil
             request.path = components.path
 
-            let bodyData = try DeveloperAPIXcodeAuthMiddleware.queryEncoder.encode(["urlEncodedQueryParams": query])
-            body = HTTPBody(bodyData)
+            requestBodyData = try DeveloperAPIXcodeAuthMiddleware.queryEncoder.encode(
+                ["urlEncodedQueryParams": query]
+            )
         case .patch, .post:
             // set .data.attributes.teamId = teamID
 
@@ -208,15 +213,23 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
             workingData["attributes"] = workingAttributes
             workingBody["data"] = workingData
 
-            let encodedBody = try JSONSerialization.data(withJSONObject: workingBody)
-
-            body = HTTPBody(encodedBody)
-            request.headerFields[.contentLength] = "\(encodedBody.count)"
+            requestBodyData = try JSONSerialization.data(withJSONObject: workingBody)
         default:
             throw Errors.unrecognizedHTTPMethod(originalMethod.rawValue)
         }
 
-        var (response, responseBody) = try await next(request, body, DeveloperAPIXcodeAuthMiddleware.baseURL)
+        if let requestBodyData {
+            request.headerFields[.contentLength] = "\(requestBodyData.count)"
+        } else {
+            request.headerFields[.contentLength] = nil
+        }
+
+        let preparedRequest = request
+        let preparedRequestBodyData = requestBodyData
+        var (response, responseBody) = try await retrying {
+            let body = preparedRequestBodyData.map(HTTPBody.init)
+            return try await next(preparedRequest, body, DeveloperAPIXcodeAuthMiddleware.baseURL)
+        }
 
         if response.headerFields[.contentType] == "application/vnd.api+json" {
             response.headerFields[.contentType] = "application/json"
@@ -225,9 +238,53 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
         return (response, responseBody)
     }
 
+    private func retrying<T>(
+        _ action: @Sendable () async throws -> T
+    ) async throws -> T {
+        var attempt = 0
+        var lastError: Error?
+        while attempt < DeveloperAPIXcodeAuthMiddleware.retryAttempts {
+            attempt += 1
+            do {
+                return try await action()
+            } catch {
+                guard shouldRetry(error), attempt < DeveloperAPIXcodeAuthMiddleware.retryAttempts else {
+                    throw error
+                }
+                lastError = error
+                try? await Task.sleep(nanoseconds: UInt64(attempt) * DeveloperAPIXcodeAuthMiddleware.retryDelayNanoseconds)
+            }
+        }
+        throw lastError ?? Errors.retryExhausted
+    }
+
+    private func shouldRetry(_ error: Error) -> Bool {
+        if let decodingError = error as? DecodingError {
+            switch decodingError {
+            case .dataCorrupted, .keyNotFound, .typeMismatch, .valueNotFound:
+                return true
+            @unknown default:
+                return true
+            }
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain, nsError.code == 3840 {
+            return true
+        }
+
+        let description = String(describing: error).lowercased()
+        return description.contains("not valid json")
+            || description.contains("unexpected end of file")
+            || description.contains("isn’t in the correct format")
+            || description.contains("isn't in the correct format")
+            || description.contains("malformedpayload")
+    }
+
     public enum Errors: Error {
         case unrecognizedHTTPMethod(String)
         case malformedPayload(String)
+        case retryExhausted
     }
 }
 
