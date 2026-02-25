@@ -182,38 +182,25 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
                 ["urlEncodedQueryParams": query]
             )
         case .patch, .post:
-            // set .data.attributes.teamId = teamID
-
-            var workingBody: [String: Any] = [:]
-            if let existingBody = body {
-                let data = try await Data(collecting: existingBody, upTo: .max)
-                guard let decodedBody = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    throw Errors.malformedPayload("body")
-                }
-                workingBody = decodedBody
+            let originalBodyData: Data?
+            if let body {
+                originalBodyData = try await Data(collecting: body, upTo: .max)
+            } else {
+                originalBodyData = nil
             }
-
-            var workingData: [String: Any] = [:]
-            if let existingData = workingBody["data"] {
-                guard let decodedData = existingData as? [String: Any] else {
-                    throw Errors.malformedPayload("data")
-                }
-                workingData = decodedData
+            if let originalBodyData, !originalBodyData.isEmpty,
+               var workingBody = try decodeJSONObject(data: originalBodyData) {
+                var workingData = workingBody["data"] as? [String: Any] ?? [:]
+                var workingAttributes = workingData["attributes"] as? [String: Any] ?? [:]
+                workingAttributes["teamId"] = authData.teamID.rawValue
+                workingData["attributes"] = workingAttributes
+                workingBody["data"] = workingData
+                requestBodyData = try JSONSerialization.data(withJSONObject: workingBody)
+            } else {
+                // If payload decoding fails, preserve the original body and fall back to query teamId.
+                request = addingTeamIDQuery(to: request)
+                requestBodyData = originalBodyData
             }
-
-            var workingAttributes: [String: Any] = [:]
-            if let existingAttributes = workingData["attributes"] {
-                guard let decodedAttributes = existingAttributes as? [String: Any] else {
-                    throw Errors.malformedPayload("attributes")
-                }
-                workingAttributes = decodedAttributes
-            }
-
-            workingAttributes["teamId"] = authData.teamID.rawValue
-            workingData["attributes"] = workingAttributes
-            workingBody["data"] = workingData
-
-            requestBodyData = try JSONSerialization.data(withJSONObject: workingBody)
         default:
             throw Errors.unrecognizedHTTPMethod(originalMethod.rawValue)
         }
@@ -279,6 +266,23 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
             || description.contains("isn’t in the correct format")
             || description.contains("isn't in the correct format")
             || description.contains("malformedpayload")
+    }
+
+    private func decodeJSONObject(data: Data) throws -> [String: Any]? {
+        guard !data.isEmpty else { return nil }
+        let object = try JSONSerialization.jsonObject(with: data)
+        return object as? [String: Any]
+    }
+
+    private func addingTeamIDQuery(to request: HTTPRequest) -> HTTPRequest {
+        var updatedRequest = request
+        let path = updatedRequest.path ?? "/"
+        var components = URLComponents(string: path) ?? .init()
+        var items = components.queryItems ?? []
+        items.upsertQueryItems([URLQueryItem(name: "teamId", value: authData.teamID.rawValue)])
+        components.queryItems = items
+        updatedRequest.path = components.string ?? path
+        return updatedRequest
     }
 
     public enum Errors: Error {

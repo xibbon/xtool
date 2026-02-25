@@ -26,6 +26,20 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
 
     public func perform() async throws {
         guard let targetDevice = try resolveTargetDevice() else { return }
+        let normalizedUDID = targetDevice.udid.uppercased()
+
+        // Device registration is idempotent: if the device is already present and enabled,
+        // skip createInstance entirely to avoid unnecessary API conflicts.
+        if let existingDevice = try await findRegisteredDevice(udid: normalizedUDID) {
+            if existingDevice.attributes?.status?.value1 == .enabled {
+                return
+            }
+            if existingDevice.attributes?.status?.value1 == .disabled {
+                await tryEnableDevice(existingDevice)
+            }
+            try await waitForDeviceAvailability(udid: normalizedUDID)
+            return
+        }
 
         // try to register the device
         let response = try await context.developerAPIClient.devicesCreateInstance(
@@ -34,7 +48,7 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
                 attributes: .init(
                     name: targetDevice.name,
                     platform: .init(platform.bundleIDPlatform),
-                    udid: targetDevice.udid
+                    udid: normalizedUDID
                 )
             )))
         )
@@ -42,14 +56,32 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
         // we get a 409 CONFLICT if the device was already registered.
         // handle this by returning gracefully.
         if (try? response.conflict) != nil {
-            try await waitForDeviceAvailability(udid: targetDevice.udid)
+            try await waitForDeviceAvailability(udid: normalizedUDID)
             return
         }
 
         // otherwise, we should get a 201 CREATED to indicate that the device
         // was added. any other case is unexpected, and this will throw.
         _ = try response.created
-        try await waitForDeviceAvailability(udid: targetDevice.udid)
+        try await waitForDeviceAvailability(udid: normalizedUDID)
+    }
+
+    private func findRegisteredDevice(udid: String) async throws -> Components.Schemas.Device? {
+        let pages = DeveloperAPIPages {
+            try await context.developerAPIClient.devicesGetCollection().ok.body.json
+        } next: {
+            $0.links.next
+        }
+
+        for try await page in pages {
+            if let matchingDevice = page.data.first(where: { device in
+                device.attributes?.udid?.uppercased() == udid
+            }) {
+                return matchingDevice
+            }
+        }
+
+        return nil
     }
 
     private func resolveTargetDevice() throws -> SigningContext.TargetDevice? {
