@@ -63,6 +63,33 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
         return app.appendingPathComponent(executableName)
     }
 
+    private func sidecarEntitlementsURLs(for app: URL) -> [URL] {
+        [
+            app.appendingPathComponent("archived-expanded-entitlements.xcent"),
+            app.appendingPathComponent("Contents").appendingPathComponent("archived-expanded-entitlements.xcent")
+        ]
+    }
+
+    private func readEntitlements(at url: URL) -> Entitlements? {
+        guard let entitlementsData = try? Data(contentsOf: url) else { return nil }
+        return try? PropertyListDecoder().decode(Entitlements.self, from: entitlementsData)
+    }
+
+    private func loadEntitlements(for app: URL, executableURL: URL) async throws -> Entitlements {
+        for sidecarURL in sidecarEntitlementsURLs(for: app) where FileManager.default.fileExists(atPath: sidecarURL.path) {
+            if let sidecarEntitlements = readEntitlements(at: sidecarURL) {
+                return sidecarEntitlements
+            }
+        }
+
+        if let entitlementsData = try? await context.signer.analyze(executable: executableURL),
+            let analyzedEntitlements = try? PropertyListDecoder().decode(Entitlements.self, from: entitlementsData) {
+            return analyzedEntitlements
+        }
+
+        return try Entitlements(entitlements: [])
+    }
+
     /// Registers the app with the given entitlements
     private func upsertApp(
         bundleID: String,
@@ -211,21 +238,12 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
         }
         let executableURL = executableURL(for: app, executableName: executable)
 
-        var entitlements: Entitlements
-        // if the executable doesn't already have entitlements, that's
-        // okay. We don't have to throw an error.
-        if let entitlementsData = try? await context.signer.analyze(executable: executableURL),
-            let decodedEntitlements = try? PropertyListDecoder().decode(Entitlements.self, from: entitlementsData) {
-            entitlements = decodedEntitlements
-
-            if isFreeTeam {
-                // re-assign rather than using updateEntitlements since the latter will
-                // retain unrecognized entitlements
-                let filtered = try entitlements.entitlements().filter { $0.anyCapability?.isFree != false }
-                entitlements = try Entitlements(entitlements: filtered)
-            }
-        } else {
-            entitlements = try Entitlements(entitlements: [])
+        var entitlements = try await loadEntitlements(for: app, executableURL: executableURL)
+        if isFreeTeam {
+            // re-assign rather than using updateEntitlements since the latter will
+            // retain unrecognized entitlements
+            let filtered = try entitlements.entitlements().filter { $0.anyCapability?.isFree != false }
+            entitlements = try Entitlements(entitlements: filtered)
         }
 
         let appID = try await upsertApp(bundleID: bundleID, entitlements: entitlements, isFreeTeam: isFreeTeam)

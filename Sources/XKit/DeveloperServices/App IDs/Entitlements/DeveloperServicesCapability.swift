@@ -127,6 +127,12 @@ extension APSEnvironmentEntitlement: EntitlementWithCapability {
     }
 }
 
+extension GameCenterEntitlement: EntitlementWithCapability {
+    var capability: DeveloperServicesCapability {
+        DeveloperServicesCapability(.gameCenter, isFree: false)
+    }
+}
+
 extension SiriKitEntitlement: EntitlementWithCapability {
     var capability: DeveloperServicesCapability {
         DeveloperServicesCapability(.sirikit, isFree: false)

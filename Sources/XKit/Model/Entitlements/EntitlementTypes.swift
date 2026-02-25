@@ -21,6 +21,7 @@ extension EntitlementContainer {
         MacGetTaskAllowEntitlement.self,
 //        AssociatedDomainsEntitlement.self,
         APSEnvironmentEntitlement.self,
+        GameCenterEntitlement.self,
         AppGroupEntitlement.self,
 //        NetworkExtensionEntitlement.self,
         MultipathEntitlement.self,
@@ -119,6 +120,13 @@ public enum APSEnvironmentEntitlement: String, Entitlement {
 
     case development
     case production
+}
+
+public struct GameCenterEntitlement: Entitlement, RawRepresentable {
+    public static let identifier = "com.apple.developer.game-center"
+
+    public var rawValue: Bool
+    public init(rawValue: Bool) { self.rawValue = rawValue }
 }
 
 public enum DataProtectionEntitlement: String, Entitlement {
