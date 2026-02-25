@@ -28,6 +28,7 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
     public let progress: @Sendable (Double) -> Void
     public let status: @Sendable (String) -> Void
     @Dependency(\.signingInfoManager) private var signingInfoManager
+    @Dependency(\.keyValueStorage) private var keyValueStorage
     public init(
         context: SigningContext,
         app: URL,
@@ -120,6 +121,13 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
 
         if let lastError {
             throw lastError
+        }
+
+        // Persist profiles for offline/fast subsequent deploys.
+        do {
+            try persistProvisioningCache(for: provisioningDict)
+        } catch {
+            // Best effort only; provisioning succeeded so this should not fail the deploy.
         }
 
         progress(3/3)
@@ -218,29 +226,7 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
             return nil
         }
 
-        let profileURL = bundleURL.appendingPathComponent(platform.embeddedProvisioningProfileRelativePath)
-        guard let profileData = try? Data(contentsOf: profileURL) else {
-            return nil
-        }
-        let mobileprovision = try Mobileprovision(data: profileData)
-        let digest = try mobileprovision.digest()
-
-        guard digest.expirationDate > Date() else {
-            return nil
-        }
-
-        let certificateSerial = signingInfo.certificate.serialNumber().uppercased()
-        guard digest.certificates.contains(where: { $0.serialNumber().uppercased() == certificateSerial }) else {
-            return nil
-        }
-
-        if let expectedUDID = try expectedDeviceUDID(for: platform) {
-            let hasDevice = digest.devices.contains { $0.uppercased() == expectedUDID }
-            guard hasDevice else {
-                return nil
-            }
-        }
-
+        let expectedUDID = try expectedDeviceUDID(for: platform)
         let newBundleID = ProvisioningIdentifiers.identifier(
             fromSanitized: bundleID,
             context: context
@@ -276,15 +262,132 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
             }
         }
 
-        guard try entitlementsAreCompatible(required: entitlements, provisioned: digest.entitlements) else {
-            return nil
+        for candidate in try provisioningCandidates(
+            for: bundleURL,
+            originalBundleID: bundleID,
+            platform: platform,
+            expectedDeviceUDID: expectedUDID
+        ) {
+            guard let mobileprovision = try? Mobileprovision(data: candidate.data),
+                  let digest = try? mobileprovision.digest()
+            else {
+                continue
+            }
+
+            guard digest.expirationDate > Date() else {
+                continue
+            }
+
+            let certificateSerial = signingInfo.certificate.serialNumber().uppercased()
+            guard digest.certificates.contains(where: { $0.serialNumber().uppercased() == certificateSerial }) else {
+                continue
+            }
+
+            if let expectedUDID {
+                let hasDevice = digest.devices.contains { $0.uppercased() == expectedUDID }
+                guard hasDevice else {
+                    continue
+                }
+            }
+
+            guard try entitlementsAreCompatible(required: entitlements, provisioned: digest.entitlements) else {
+                continue
+            }
+
+            return ProvisioningInfo(
+                newBundleID: newBundleID,
+                entitlements: entitlements,
+                mobileprovision: mobileprovision
+            )
+        }
+        return nil
+    }
+
+    private enum ProvisioningCandidateSource {
+        case embedded
+        case cached
+    }
+
+    private struct ProvisioningCandidate {
+        let source: ProvisioningCandidateSource
+        let data: Data
+    }
+
+    private func provisioningCandidates(
+        for bundleURL: URL,
+        originalBundleID: String,
+        platform: ProvisioningPlatform,
+        expectedDeviceUDID: String?
+    ) throws -> [ProvisioningCandidate] {
+        var candidates: [ProvisioningCandidate] = []
+
+        let embeddedProfileURL = bundleURL.appendingPathComponent(platform.embeddedProvisioningProfileRelativePath)
+        if let profileData = try? Data(contentsOf: embeddedProfileURL), !profileData.isEmpty {
+            candidates.append(.init(source: .embedded, data: profileData))
         }
 
-        return ProvisioningInfo(
-            newBundleID: newBundleID,
-            entitlements: entitlements,
-            mobileprovision: mobileprovision
+        let cacheKey = provisioningCacheKey(
+            originalBundleID: originalBundleID,
+            platform: platform,
+            expectedDeviceUDID: expectedDeviceUDID
         )
+        if let cachedData = try keyValueStorage.data(forKey: cacheKey),
+           !cachedData.isEmpty,
+           !candidates.contains(where: { $0.data == cachedData }) {
+            candidates.append(.init(source: .cached, data: cachedData))
+        }
+
+        return candidates
+    }
+
+    private func persistProvisioningCache(
+        for provisioningDict: [URL: ProvisioningInfo]
+    ) throws {
+        for (bundleURL, provisioningInfo) in provisioningDict {
+            let platform = ProvisioningPlatform(appBundleURL: bundleURL)
+            let infoPlistURL = self.infoPlistURL(for: bundleURL)
+
+            guard let infoPlistData = try? Data(contentsOf: infoPlistURL),
+                  let infoPlist = try? PropertyListSerialization.propertyList(
+                      from: infoPlistData,
+                      format: nil
+                  ) as? [String: Any],
+                  let originalBundleID = infoPlist["CFBundleIdentifier"] as? String
+            else {
+                continue
+            }
+
+            let expectedUDID = try? expectedDeviceUDID(for: platform)
+            let cacheKey = provisioningCacheKey(
+                originalBundleID: originalBundleID,
+                platform: platform,
+                expectedDeviceUDID: expectedUDID
+            )
+            let profileData = try provisioningInfo.mobileprovision.data()
+            try keyValueStorage.setData(profileData, forKey: cacheKey)
+        }
+    }
+
+    private func provisioningCacheKey(
+        originalBundleID: String,
+        platform: ProvisioningPlatform,
+        expectedDeviceUDID: String?
+    ) -> String {
+        let platformPart: String = switch platform {
+        case .iOS:
+            "ios"
+        case .macOS:
+            "macos"
+        }
+        let devicePart = expectedDeviceUDID ?? "no-device"
+        return "provisioning-cache/v1/\(sanitizeCacheComponent(context.auth.identityID))/\(platformPart)/\(sanitizeCacheComponent(devicePart))/\(sanitizeCacheComponent(originalBundleID))"
+    }
+
+    private func sanitizeCacheComponent(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
     }
 
     private func infoPlistURL(for app: URL) -> URL {
