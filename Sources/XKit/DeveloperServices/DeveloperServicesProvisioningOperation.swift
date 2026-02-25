@@ -50,10 +50,14 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
                 context: context,
                 platform: platform
             ).perform()
-        } catch let error as DeveloperServicesAddDeviceOperation.Errors {
-            // Device registration can take time to propagate on Apple's side.
-            // Continue to provisioning and rely on retries below.
-            status(error.localizedDescription)
+        } catch {
+            guard shouldContinueAfterRegistrationError(error) else {
+                throw error
+            }
+            // Device registration can fail transiently or return malformed
+            // middleware errors even when the device is already registered.
+            // Continue to provisioning and let profile creation retries decide.
+            status(registrationFallbackStatus(for: error))
         }
 
         progress(1/3)
@@ -135,6 +139,29 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
             }
         }
         return false
+    }
+
+    private func shouldContinueAfterRegistrationError(_ error: Error) -> Bool {
+        if error is DeveloperServicesAddDeviceOperation.Errors {
+            return true
+        }
+
+        let message = String(describing: error).lowercased()
+        return message.contains("devices_createinstance")
+            || message.contains("middleware of type 'developerapixcodeauthmiddleware'")
+            || message.contains("client encountered an error invoking the operation")
+            || message.contains("could not connect to the server")
+            || message.contains("isn’t in the correct format")
+            || message.contains("isn't in the correct format")
+    }
+
+    private func registrationFallbackStatus(for error: Error) -> String {
+        if let localized = error as? LocalizedError,
+           let description = localized.errorDescription,
+           !description.isEmpty {
+            return description
+        }
+        return "Device registration check failed. Continuing with existing registered devices."
     }
 
 }
