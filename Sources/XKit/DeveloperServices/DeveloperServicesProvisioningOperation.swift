@@ -29,6 +29,7 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
     public let status: @Sendable (String) -> Void
     @Dependency(\.signingInfoManager) private var signingInfoManager
     @Dependency(\.keyValueStorage) private var keyValueStorage
+    @Dependency(\.persistentDirectory) private var persistentDirectory
     public init(
         context: SigningContext,
         app: URL,
@@ -326,15 +327,17 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
             candidates.append(.init(source: .embedded, data: profileData))
         }
 
-        let cacheKey = provisioningCacheKey(
+        let cacheKeys = provisioningCacheKeys(
             originalBundleID: originalBundleID,
             platform: platform,
             expectedDeviceUDID: expectedDeviceUDID
         )
-        if let cachedData = try keyValueStorage.data(forKey: cacheKey),
-           !cachedData.isEmpty,
-           !candidates.contains(where: { $0.data == cachedData }) {
-            candidates.append(.init(source: .cached, data: cachedData))
+        for cacheKey in cacheKeys {
+            if let cachedData = try cachedProvisioningData(forKey: cacheKey),
+               !cachedData.isEmpty,
+               !candidates.contains(where: { $0.data == cachedData }) {
+                candidates.append(.init(source: .cached, data: cachedData))
+            }
         }
 
         return candidates
@@ -358,20 +361,56 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
             }
 
             let expectedUDID = try? expectedDeviceUDID(for: platform)
-            let cacheKey = provisioningCacheKey(
+            let profileData = try provisioningInfo.mobileprovision.data()
+            let cacheKeys = provisioningCacheKeys(
                 originalBundleID: originalBundleID,
                 platform: platform,
                 expectedDeviceUDID: expectedUDID
             )
-            let profileData = try provisioningInfo.mobileprovision.data()
-            try keyValueStorage.setData(profileData, forKey: cacheKey)
+            for cacheKey in cacheKeys {
+                try persistProvisioningData(profileData, forKey: cacheKey)
+            }
         }
+    }
+
+    private func provisioningCacheKeys(
+        originalBundleID: String,
+        platform: ProvisioningPlatform,
+        expectedDeviceUDID: String?
+    ) -> [String] {
+        let sanitizedBundleID = ProvisioningIdentifiers.sanitize(identifier: originalBundleID)
+        let prefixedBundleID = ProvisioningIdentifiers.identifier(
+            fromSanitized: sanitizedBundleID,
+            context: context
+        )
+
+        let bundleCandidates = uniqueValues([originalBundleID, sanitizedBundleID, prefixedBundleID])
+
+        var deviceCandidates = ["no-device"]
+        if let expectedDeviceUDID, !expectedDeviceUDID.isEmpty {
+            deviceCandidates.insert(expectedDeviceUDID.uppercased(), at: 0)
+        }
+
+        var keys: [String] = []
+        for bundleCandidate in bundleCandidates {
+            for deviceCandidate in deviceCandidates {
+                keys.append(
+                    provisioningCacheKey(
+                        originalBundleID: bundleCandidate,
+                        platform: platform,
+                        devicePart: deviceCandidate
+                    )
+                )
+            }
+        }
+
+        return uniqueValues(keys)
     }
 
     private func provisioningCacheKey(
         originalBundleID: String,
         platform: ProvisioningPlatform,
-        expectedDeviceUDID: String?
+        devicePart: String
     ) -> String {
         let platformPart: String = switch platform {
         case .iOS:
@@ -379,8 +418,59 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
         case .macOS:
             "macos"
         }
-        let devicePart = expectedDeviceUDID ?? "no-device"
         return "provisioning-cache/v1/\(sanitizeCacheComponent(context.auth.identityID))/\(platformPart)/\(sanitizeCacheComponent(devicePart))/\(sanitizeCacheComponent(originalBundleID))"
+    }
+
+    private func cachedProvisioningData(forKey cacheKey: String) throws -> Data? {
+        if let cachedData = try keyValueStorage.data(forKey: cacheKey),
+           !cachedData.isEmpty {
+            return cachedData
+        }
+
+        let diskURL = provisioningDiskCacheURL(forKey: cacheKey)
+        if let diskData = try? Data(contentsOf: diskURL),
+           !diskData.isEmpty {
+            return diskData
+        }
+
+        return nil
+    }
+
+    private func persistProvisioningData(_ data: Data, forKey cacheKey: String) throws {
+        var storageError: Error?
+        var diskError: Error?
+
+        do {
+            try keyValueStorage.setData(data, forKey: cacheKey)
+        } catch {
+            storageError = error
+        }
+
+        do {
+            let diskURL = provisioningDiskCacheURL(forKey: cacheKey)
+            try FileManager.default.createDirectory(
+                at: diskURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: diskURL, options: .atomic)
+        } catch {
+            diskError = error
+        }
+
+        if storageError != nil, let diskError {
+            throw diskError
+        }
+    }
+
+    private func provisioningDiskCacheURL(forKey cacheKey: String) -> URL {
+        let fileName = sanitizeCacheComponent(
+            cacheKey
+                .replacingOccurrences(of: "/", with: "__")
+                .replacingOccurrences(of: ".", with: "_")
+        )
+        return persistentDirectory
+            .appendingPathComponent("provisioning-cache", isDirectory: true)
+            .appendingPathComponent(fileName, isDirectory: false)
     }
 
     private func sanitizeCacheComponent(_ value: String) -> String {
@@ -388,6 +478,16 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: ":", with: "_")
             .replacingOccurrences(of: " ", with: "_")
+    }
+
+    private func uniqueValues(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        var unique: [String] = []
+        unique.reserveCapacity(values.count)
+        for value in values where seen.insert(value).inserted {
+            unique.append(value)
+        }
+        return unique
     }
 
     private func infoPlistURL(for app: URL) -> URL {
