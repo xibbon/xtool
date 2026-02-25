@@ -101,7 +101,7 @@ public struct DeveloperServicesAddAppOperation: DeveloperServicesOperation {
 
         let existing = try await context.developerAPIClient
             .bundleIdsGetCollection(query: .init(
-                filter_lbrack_identifier_rbrack_: [bundleID]
+                filter_lbrack_identifier_rbrack_: [newBundleID]
             ))
             .ok.body.json.data
             // filter[identifier] is a prefix filter so we need to manually upgrade to equality
