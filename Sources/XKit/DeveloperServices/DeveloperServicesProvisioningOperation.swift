@@ -55,7 +55,7 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
             return .init(signingInfo: signingInfo, provisioningDict: provisioningDict)
         }
 
-        status("Registering \(platform.displayName) device…")
+        status("Checking \(platform.displayName) device registration…")
         do {
             try await DeveloperServicesAddDeviceOperation(
                 context: context,
