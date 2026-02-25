@@ -1,5 +1,5 @@
 {
-  "originHash" : "46362103e2d6af96d698d11b03cad7e54009aa6a269521a074a5b7022b47eed1",
+  "originHash" : "9ce014abaf553bb133f54f5e8e858400689896ffd4d7ebcf8392a60eb2676cf9",
   "pins" : [
     {
       "identity" : "aexml",
@@ -457,7 +457,7 @@
       "location" : "https://github.com/xibbon/zsign.git",
       "state" : {
         "branch" : "master",
-        "revision" : "68da2cab70b8cf862f3c37e0cf2af321cfa588f2"
+        "revision" : "124997dbd0c7d6f926c9dc9344701064ffc41971"
       }
     }
   ],
