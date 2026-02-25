@@ -1,5 +1,5 @@
 {
-  "originHash" : "dcba04b7f3f00a110ef7566e27309af4a017796d4f66fe0ca05b166ddbcf882c",
+  "originHash" : "46362103e2d6af96d698d11b03cad7e54009aa6a269521a074a5b7022b47eed1",
   "pins" : [
     {
       "identity" : "aexml",
@@ -454,10 +454,10 @@
     {
       "identity" : "zsign",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/xtool-org/zsign",
+      "location" : "https://github.com/xibbon/zsign.git",
       "state" : {
-        "revision" : "6c4a9f52dd8bf374aa938ef9c17d5f261f2c333a",
-        "version" : "1.7.0"
+        "branch" : "master",
+        "revision" : "68da2cab70b8cf862f3c37e0cf2af321cfa588f2"
       }
     }
   ],

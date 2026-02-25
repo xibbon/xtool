@@ -1,6 +1,7 @@
 // swift-tools-version:6.0
 
 import PackageDescription
+import Foundation
 
 let xtoolVersion: String? = {
     if let explicitVersion = Context.environment["XTOOL_VERSION"] {
@@ -13,6 +14,23 @@ let xtoolVersion: String? = {
     } else {
         return nil
     }
+}()
+
+let configuredLocalZSignPath = Context.environment["ZSIGN_LOCAL_PATH"]?
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+let resolvedLocalZSignPath: String? = {
+    guard let configuredLocalZSignPath, !configuredLocalZSignPath.isEmpty else {
+        return nil
+    }
+    return NSString(string: configuredLocalZSignPath).expandingTildeInPath
+}()
+let zsignPackageDependency: Package.Dependency = {
+    if let resolvedLocalZSignPath,
+       FileManager.default.fileExists(atPath: resolvedLocalZSignPath)
+    {
+        return .package(path: resolvedLocalZSignPath)
+    }
+    return .package(url: "https://github.com/xibbon/zsign.git", branch: "master")
 }()
 
 let cSettings: [CSetting] = [
@@ -42,7 +60,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/xtool-org/xtool-core", .upToNextMinor(from: "1.4.0")),
         .package(url: "https://github.com/xtool-org/SwiftyMobileDevice", .upToNextMinor(from: "1.5.0")),
-        .package(url: "https://github.com/xtool-org/zsign", .upToNextMinor(from: "1.7.0")),
+        zsignPackageDependency,
 
         .package(url: "https://github.com/apple/swift-system", from: "1.4.0"),
         .package(url: "https://github.com/apple/swift-http-types", from: "1.3.1"),
