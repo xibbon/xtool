@@ -61,7 +61,7 @@ let package = Package(
         .package(url: "https://github.com/vapor/websocket-kit.git", from: "2.15.0"),
 
         .package(url: "https://github.com/pointfreeco/swift-concurrency-extras", from: "1.3.0"),
-        .package(url: "https://github.com/pointfreeco/swift-dependencies", from: "1.6.2"),
+        .package(url: "https://github.com/xibbon/swift-dependencies", from: "1.6.2"),
 
         .package(url: "https://github.com/attaswift/BigInt", from: "5.5.0"),
         .package(url: "https://github.com/mxcl/Version", from: "2.1.0"),
