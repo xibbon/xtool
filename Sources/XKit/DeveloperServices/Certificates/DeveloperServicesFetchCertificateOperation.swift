@@ -111,12 +111,31 @@ public struct DeveloperServicesFetchCertificateOperation: DeveloperServicesOpera
             persistSigningInfo(signingInfo)
             return signingInfo
         } catch Error.certificateAlreadyExists {
+            // A certificate already exists that wasn't revoked (e.g. isFree check
+            // returned nil, or revocation was skipped). Try the keychain first.
             let latestCertificates = try await context.developerAPIClient.certificatesGetCollection().ok.body.json.data
             if let recovered = loadSigningInfoFromKeychain(matching: latestCertificates) {
                 persistSigningInfo(recovered)
                 return recovered
             }
-            throw Error.existingDevelopmentCertificateRequiresPrivateKey
+            // Keychain doesn't have the private key. Revoke and retry as last resort.
+            let developmentCerts = latestCertificates.filter { isDevelopmentCertificate($0) }
+            guard !developmentCerts.isEmpty else {
+                throw Error.existingDevelopmentCertificateRequiresPrivateKey
+            }
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for cert in developmentCerts {
+                    group.addTask {
+                        _ = try await self.context.developerAPIClient
+                            .certificatesDeleteInstance(path: .init(id: cert.id))
+                            .noContent
+                    }
+                }
+                try await group.waitForAll()
+            }
+            let signingInfo = try await createCertificate()
+            persistSigningInfo(signingInfo)
+            return signingInfo
         }
     }
 
@@ -140,11 +159,13 @@ public struct DeveloperServicesFetchCertificateOperation: DeveloperServicesOpera
         let activeDevelopmentCertificates = certificates.filter { certificate in
             isDevelopmentCertificate(certificate) && isCertificateActive(certificate)
         }
-        if !activeDevelopmentCertificates.isEmpty {
+        // On paid accounts, refuse to revoke certs that may be in use elsewhere.
+        // On free accounts (or when no active dev certs exist), proceed with replacement.
+        let isFree = try await context.auth.team()?.isFree ?? true
+        if !activeDevelopmentCertificates.isEmpty && !isFree {
             throw Error.existingDevelopmentCertificateRequiresPrivateKey
         }
 
-        // No reusable active Development cert exists, so create a new one.
         return try await self.replaceCertificates(certificates, requireConfirmation: true)
     }
 
