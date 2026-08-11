@@ -1,5 +1,5 @@
 {
-  "originHash" : "9ce014abaf553bb133f54f5e8e858400689896ffd4d7ebcf8392a60eb2676cf9",
+  "originHash" : "620fe2137ddd7e1d0019d9cd9996d4cabd23df9ace27d4864ff674e76a6ad178",
   "pins" : [
     {
       "identity" : "aexml",
@@ -175,7 +175,7 @@
     {
       "identity" : "swift-dependencies",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/pointfreeco/swift-dependencies",
+      "location" : "https://github.com/xibbon/swift-dependencies",
       "state" : {
         "revision" : "a10f9feeb214bc72b5337b6ef6d5a029360db4cc",
         "version" : "1.10.0"
@@ -436,10 +436,9 @@
     {
       "identity" : "xtool-core",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/xtool-org/xtool-core",
+      "location" : "https://github.com/xibbon/xtool-core.git",
       "state" : {
-        "revision" : "d412ac768d1e73d16ad7ccc6805f12fc701709f6",
-        "version" : "1.4.0"
+        "revision" : "bff9cd0259917f31b4af1cc9cec91f677cb3c109"
       }
     },
     {
