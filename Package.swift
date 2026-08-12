@@ -43,7 +43,7 @@ let package = Package(
         .package(
             url: "https://github.com/xibbon/xtool-core.git",
             revision: "bff9cd0259917f31b4af1cc9cec91f677cb3c109"),
-        .package(url: "https://github.com/xtool-org/SwiftyMobileDevice", .upToNextMinor(from: "1.5.0")),
+        .package(url: "https://github.com/xibbon/SwiftyMobileDevice.git", branch: "main"),
         .package(url: "https://github.com/xibbon/zsign.git", branch: "master"),
 
         .package(url: "https://github.com/apple/swift-system", from: "1.4.0"),
