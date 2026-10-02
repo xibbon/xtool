@@ -15,13 +15,16 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
 
     public let context: SigningContext
     public let platform: ProvisioningPlatform
+    public let useContextTargetDevice: Bool
 
     public init(
         context: SigningContext,
-        platform: ProvisioningPlatform = .iOS
+        platform: ProvisioningPlatform = .iOS,
+        useContextTargetDevice: Bool = false
     ) {
         self.context = context
         self.platform = platform
+        self.useContextTargetDevice = useContextTargetDevice
     }
 
     public func perform() async throws {
@@ -68,14 +71,18 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
 
     private func findRegisteredDevice(udid: String) async throws -> Components.Schemas.Device? {
         let pages = DeveloperAPIPages {
-            try await context.developerAPIClient.devicesGetCollection().ok.body.json
+            try await context.developerAPIClient.devicesGetCollection(query: .init(
+                filter_lbrack_platform_rbrack_: [platform == .macOS ? .macOs : .ios],
+                filter_lbrack_udid_rbrack_: [udid]
+            )).ok.body.json
         } next: {
             $0.links.next
         }
 
         for try await page in pages {
             if let matchingDevice = page.data.first(where: { device in
-                device.attributes?.udid?.uppercased() == udid
+                device.attributes?.udid?.uppercased() == udid &&
+                    device.attributes?.platform?.value1 == platform.bundleIDPlatform
             }) {
                 return matchingDevice
             }
@@ -85,6 +92,9 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
     }
 
     private func resolveTargetDevice() throws -> SigningContext.TargetDevice? {
+        if useContextTargetDevice {
+            return context.targetDevice
+        }
         switch platform {
         case .iOS:
             return context.targetDevice
@@ -104,7 +114,10 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
 
         for attempt in 0 ..< maxAttempts {
             let pages = DeveloperAPIPages {
-                try await context.developerAPIClient.devicesGetCollection().ok.body.json
+                try await context.developerAPIClient.devicesGetCollection(query: .init(
+                    filter_lbrack_platform_rbrack_: [platform == .macOS ? .macOs : .ios],
+                    filter_lbrack_udid_rbrack_: [normalizedUDID]
+                )).ok.body.json
             } next: {
                 $0.links.next
             }
@@ -112,7 +125,8 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
             for try await page in pages {
                 for device in page.data {
                     guard let deviceUDID = device.attributes?.udid?.uppercased(),
-                          deviceUDID == normalizedUDID
+                          deviceUDID == normalizedUDID,
+                          device.attributes?.platform?.value1 == platform.bundleIDPlatform
                     else {
                         continue
                     }
@@ -178,7 +192,7 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
     private func currentMacProvisioningUDID() throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
-        process.arguments = ["SPHardwareDataType"]
+        process.arguments = ["SPHardwareDataType", "-json"]
 
         let outputPipe = Pipe()
         process.standardOutput = outputPipe
@@ -188,21 +202,14 @@ public struct DeveloperServicesAddDeviceOperation: DeveloperServicesOperation {
         process.waitUntilExit()
 
         let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: outputData, encoding: .utf8) ?? ""
-
         guard process.terminationStatus == 0 else {
             throw CocoaError(.executableLoad)
         }
-
-        let marker = "Provisioning UDID:"
-        if let markerRange = output.range(of: marker) {
-            let suffix = output[markerRange.upperBound...]
-            let udid = suffix
-                .prefix { $0 != "\n" && $0 != "\r" }
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !udid.isEmpty {
-                return udid.uppercased()
-            }
+        if let document = try JSONSerialization.jsonObject(with: outputData) as? [String: Any],
+           let hardware = document["SPHardwareDataType"] as? [[String: Any]],
+           let udid = hardware.first?["provisioning_UDID"] as? String,
+           !udid.isEmpty {
+            return udid.uppercased()
         }
 
         // Fallback for environments where system_profiler does not report a provisioning UDID.

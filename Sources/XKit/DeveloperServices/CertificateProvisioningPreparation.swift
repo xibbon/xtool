@@ -31,7 +31,8 @@ public enum CertificateProvisioningPreparation {
         teamID: String,
         originalBundleID: String,
         finalBundleID: String,
-        context: SigningContext
+        context: SigningContext,
+        platform: ProvisioningPlatform = .iOS
     ) throws -> CertificateProvisioningNormalization {
         let original = try dictionary(entitlements)
         var result = entitlements
@@ -45,18 +46,32 @@ public enum CertificateProvisioningPreparation {
         let removed = Set(original.keys).subtracting(filtered.keys).sorted()
         try result.update(teamID: .init(rawValue: teamID), bundleID: finalBundleID)
         try result.updateEntitlements { values in
-            values.removeAll { $0 is GetTaskAllowEntitlement }
-            values.append(GetTaskAllowEntitlement(rawValue: true))
+            if platform == .macOS {
+                values.removeAll {
+                    $0 is ApplicationIdentifierEntitlement || $0 is MacApplicationIdentifierEntitlement ||
+                        $0 is GetTaskAllowEntitlement || $0 is MacGetTaskAllowEntitlement
+                }
+                values.append(MacApplicationIdentifierEntitlement(rawValue: teamID + "." + finalBundleID))
+                values.append(MacGetTaskAllowEntitlement(rawValue: true))
+            } else {
+                values.removeAll { $0 is GetTaskAllowEntitlement }
+                values.append(GetTaskAllowEntitlement(rawValue: true))
+            }
         }
         var normalized = try dictionary(result)
         // Preserve shared keychain groups. Replace only the source app identifier
         // and its original team prefix; do not collapse all groups into one.
         if let groups = filtered[KeychainAccessGroupsEntitlement.identifier] as? [String] {
-            let oldApplicationID = filtered[ApplicationIdentifierEntitlement.identifier] as? String
+            let oldApplicationID = (filtered[MacApplicationIdentifierEntitlement.identifier] ?? filtered[ApplicationIdentifierEntitlement.identifier]) as? String
             let oldTeam = oldApplicationID.flatMap { value in
                 value.hasSuffix("." + originalBundleID) ? String(value.dropLast(originalBundleID.count + 1)) : nil
             }
             normalized[KeychainAccessGroupsEntitlement.identifier] = groups.map { value in
+                // Mac App ID prefixes can differ from the team ID. The caller
+                // resolves macros from the validated profile before signing.
+                if platform == .macOS {
+                    return value
+                }
                 var group = value
                 if group.hasPrefix("$(AppIdentifierPrefix)") {
                     group = teamID + "." + group.dropFirst("$(AppIdentifierPrefix)".count)
@@ -70,7 +85,7 @@ public enum CertificateProvisioningPreparation {
                 return group
             }
         }
-        if let groups = filtered[AppGroupEntitlement.identifier] as? [String] {
+        if platform == .iOS, let groups = filtered[AppGroupEntitlement.identifier] as? [String] {
             normalized[AppGroupEntitlement.identifier] = groups.map { group in
                 ProvisioningIdentifiers.groupID(
                     fromSanitized: ProvisioningIdentifiers.sanitize(groupID: .init(rawValue: group)),
