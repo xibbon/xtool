@@ -64,6 +64,107 @@ struct CertificateProvisioningTests {
         #expect(request.data.relationships.bundleId.data.id == "app")
     }
 
+    @Test func macProfileRequestUsesMacDevelopmentType() throws {
+        let request = CertificateProvisioningService.profileRequest(name: "Mac", bundleResourceID: "app", certificateResourceID: "certificate", deviceResourceID: "mac", platform: .macOS)
+        #expect(request.data.attributes.profileType.value1 == .macAppDevelopment)
+        #expect(request.data.relationships.devices?.data?.map(\.id) == ["mac"])
+        let legacy = CertificateProvisioningService.profileRequest(name: "iOS", bundleResourceID: "app", certificateResourceID: "certificate", deviceResourceID: "phone")
+        #expect(legacy.data.attributes.profileType.value1 == .iosAppDevelopment)
+    }
+
+    @Test func macNormalizationUsesMacClaimsAndPreservesExactGroups() throws {
+        let fixture = try Fixture()
+        let requested = try fixture.entitlements([
+            "application-identifier": "OLD.com.example.game",
+            "get-task-allow": false,
+            "com.apple.security.application-groups": ["group.com.example.shared"],
+            "keychain-access-groups": ["OLD.com.example.game", "OLD.shared"]
+        ])
+        let normalized = try CertificateProvisioningPreparation.normalizeEntitlements(requested, isFreeTeam: false, teamID: "TEAM", originalBundleID: "com.example.game", finalBundleID: "com.example.game", context: fixture.context(), platform: .macOS)
+        let claims = try CertificateProvisioningPreparation.dictionary(normalized.entitlements)
+        #expect(claims["application-identifier"] == nil)
+        #expect(claims["get-task-allow"] == nil)
+        #expect(claims["com.apple.application-identifier"] as? String == "TEAM.com.example.game")
+        #expect(claims["com.apple.security.get-task-allow"] as? Bool == true)
+        #expect(claims["com.apple.security.application-groups"] as? [String] == ["group.com.example.shared"])
+        #expect(claims["keychain-access-groups"] as? [String] == ["OLD.com.example.game", "OLD.shared"])
+    }
+
+    @Test func macHelpersCanHaveIndependentBundleIdentifiers() async throws {
+        let fixture = try Fixture()
+        let nodes = try [fixture.node(path: ".", id: "com.example.game"),
+            fixture.node(path: "Contents/XPCServices/Helper.xpc", id: "org.example.helper")]
+        let service = MockService(resources: [fixture.resource(id: "exact")])
+        let response = try await DeveloperServicesCertificateProvisioningOperation(context: fixture.context(),
+            certificate: fixture.certificate, nodes: nodes, platform: .macOS, service: service).perform()
+        #expect(response.nodes.count == 2)
+        let iosService = MockService(resources: [fixture.resource(id: "exact")])
+        await #expect(throws: CertificateProvisioningError.self) {
+            try await DeveloperServicesCertificateProvisioningOperation(context: fixture.context(),
+                certificate: fixture.certificate, nodes: nodes, service: iosService).perform()
+        }
+        #expect(await iosService.events.isEmpty)
+    }
+
+    @Test func appStoreConnectGroupsFailBeforeAnyAppleWrite() async throws {
+        _ = registerTestSigner
+        let fixture = try Fixture()
+        let context = try SigningContext(auth: .appStoreConnect(.init(id: "fixture", issuerID: "fixture", pem: "not-a-real-key")), targetDevice: .init(udid: "MAC", name: "Fixture"))
+        let root = try fixture.node(path: ".", id: "com.example.game")
+        let child = CertificateProvisioningNode(relativePath: "Contents/PlugIns/Child.appex", originalBundleID: "com.example.game.child", finalBundleID: "com.example.game.child", requestedEntitlements: try fixture.entitlements(["com.apple.security.application-groups": ["group.com.example.shared"]]))
+        let service = MockService(resources: [fixture.resource(id: "exact")])
+        await #expect(throws: CertificateProvisioningError.self) {
+            try await DeveloperServicesCertificateProvisioningOperation(context: context, certificate: fixture.certificate, nodes: [root, child], platform: .macOS, service: service).perform()
+        }
+        #expect(await service.events == ["team", "certificates"])
+    }
+
+    @Test func repeatedMacProfileRequestsReuseTheSameAuthorizedProfile() async throws {
+        let fixture = try Fixture()
+        let transport = try ProfileReuseTransport()
+        let client = DeveloperAPIClient(serverURL: URL(string: "https://example.invalid")!, configuration: .init(dateTranscoder: .iso8601WithFractionalSeconds), transport: transport)
+        let service = CertificateProvisioningService(context: try fixture.context(), platform: .macOS, profileValidator: { data, bundleID in
+            data == Data("authorized fixture".utf8) && bundleID == "com.example.game"
+        }, client: client)
+        for _ in 0..<2 {
+            let profile = try await service.createProfile(bundleResourceID: "app", bundleID: "com.example.game", certificateResourceID: "certificate")
+            #expect(profile.resourceID == "existing-profile")
+        }
+        #expect(await transport.operations == ["devices_getCollection", "profiles_getCollection", "devices_getCollection", "profiles_getCollection"])
+        #expect(await transport.deviceQueries.allSatisfy { $0.contains("filter%5Budid%5D=TARGET-UDID") && $0.contains("MAC_OS") })
+    }
+
+    @Test func expiredOrMismatchedMacProfilesDoNotReuse() async throws {
+        let fixture = try Fixture()
+        for mismatch in ["expired", "certificate", "device", "type", "bundle", "authorization"] {
+            let transport = try ProfileReuseTransport(mismatch: mismatch)
+            let client = DeveloperAPIClient(serverURL: URL(string: "https://example.invalid")!, configuration: .init(dateTranscoder: .iso8601WithFractionalSeconds), transport: transport)
+            let service = CertificateProvisioningService(context: try fixture.context(), platform: .macOS, profileValidator: { _, _ in
+                mismatch != "authorization"
+            }, client: client)
+            await #expect(throws: (any Error).self) {
+                try await service.createProfile(bundleResourceID: "app", bundleID: "com.example.game", certificateResourceID: "certificate")
+            }
+            #expect(await transport.operations == ["devices_getCollection", "profiles_getCollection", "profiles_createInstance"])
+        }
+    }
+
+    @Test func serviceErrorsKeepSafeRoleAndDeviceGuidance() {
+        struct RawError: Error, CustomStringConvertible {
+            let description: String
+        }
+        let typed = ClientError(operationID: "profiles_createInstance", operationInput: "secret input", response: HTTPResponse(status: .forbidden), causeDescription: "secret response", underlyingError: RawError(description: "opaque"))
+        let typedGuidance = DeveloperServicesCertificateProvisioningOperation.safeError(typed).localizedDescription
+        #expect(typedGuidance.contains("Admin or App Manager"))
+        #expect(!typedGuidance.contains("secret"))
+        let forbidden = DeveloperServicesCertificateProvisioningOperation.safeError(RawError(description: "403 forbidden secret token and response"))
+        #expect(forbidden.localizedDescription.contains("Admin or App Manager"))
+        #expect(!forbidden.localizedDescription.contains("secret"))
+        let devices = DeveloperServicesCertificateProvisioningOperation.safeError(RawError(description: "No current macOS devices secret response"))
+        #expect(devices.localizedDescription.contains("macOS"))
+        #expect(!devices.localizedDescription.contains("secret"))
+    }
+
     @Test func createsReplacementWithoutDeletingExistingProfilesAndPreparesWholeGraphFirst() async throws {
         let fixture = try Fixture()
         let context = try fixture.context()
@@ -268,5 +369,53 @@ private actor MockService: CertificateProvisioningServing {
             throw CertificateProvisioningError.profileLimitRequiresDecision(bundleID: bundleID)
         }
         return .init(resourceID: "replacement-" + bundleID, name: "Xogot replacement", data: Data("replacement profile".utf8))
+    }
+}
+
+private actor ProfileReuseTransport: ClientTransport {
+    let profileBody: Data
+    var operations: [String] = []
+    var deviceQueries: [String] = []
+
+    init(mismatch: String = "") throws {
+        let profile: [String: Any] = [
+            "type": "profiles",
+            "id": "existing-profile",
+            "attributes": [
+                "name": "Existing Mac profile",
+                "profileType": mismatch == "type" ? "IOS_APP_DEVELOPMENT" : "MAC_APP_DEVELOPMENT",
+                "profileState": "ACTIVE",
+                "expirationDate": mismatch == "expired" ? "2000-01-01T00:00:00.000Z" : "2099-01-01T00:00:00.000Z",
+                "profileContent": Data("authorized fixture".utf8).base64EncodedString()
+            ],
+            "relationships": [
+                "bundleId": ["data": ["type": "bundleIds", "id": mismatch == "bundle" ? "other-app" : "app"]],
+                "certificates": ["data": [["type": "certificates", "id": mismatch == "certificate" ? "other-certificate" : "certificate"]]],
+                "devices": ["data": [["type": "devices", "id": mismatch == "device" ? "other-device" : "mac"]]]
+            ]
+        ]
+        self.profileBody = try JSONSerialization.data(withJSONObject: ["data": [profile], "links": ["self": "https://example.invalid/v1/profiles"]])
+    }
+
+    func send(_ request: HTTPRequest, body: HTTPBody?, baseURL: URL, operationID: String) async throws -> (HTTPResponse, HTTPBody?) {
+        operations.append(operationID)
+        var response = HTTPResponse(status: .ok)
+        response.headerFields[.contentType] = "application/json"
+        switch operationID {
+        case "devices_getCollection":
+            deviceQueries.append(request.path ?? "")
+            let device: [String: Any] = ["type": "devices", "id": "mac", "attributes": ["platform": "MAC_OS", "udid": "TARGET-UDID", "status": "ENABLED"]]
+            let data = try JSONSerialization.data(withJSONObject: ["data": [device], "links": ["self": "https://example.invalid/v1/devices"]])
+            return (response, HTTPBody(data))
+        case "profiles_getCollection":
+            return (response, HTTPBody(profileBody))
+        case "profiles_createInstance":
+            struct CreationReached: Error {}
+            throw CreationReached()
+        default:
+            Issue.record("Unexpected provisioning API call: \(operationID)")
+            struct UnexpectedRequest: Error {}
+            throw UnexpectedRequest()
+        }
     }
 }

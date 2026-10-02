@@ -1,5 +1,6 @@
 import Foundation
 import DeveloperAPI
+import OpenAPIRuntime
 
 public struct CertificateProvisioningProfile: Sendable {
     public let resourceID: String
@@ -45,6 +46,7 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
     public let context: SigningContext
     public let certificate: ProvisioningCertificate
     public let nodes: [CertificateProvisioningNode]
+    public let platform: ProvisioningPlatform
     private let service: any CertificateProvisioningServing
     private let apiCallObserver: @Sendable (String) -> Void
     private let status: @Sendable (String) -> Void
@@ -53,6 +55,8 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
         context: SigningContext,
         certificate: ProvisioningCertificate,
         nodes: [CertificateProvisioningNode],
+        platform: ProvisioningPlatform = .iOS,
+        profileValidator: (@Sendable (Data, String) -> Bool)? = nil,
         apiCallObserver: @escaping @Sendable (String) -> Void = { _ in },
         status: @escaping @Sendable (String) -> Void = { _ in },
         service: (any CertificateProvisioningServing)? = nil
@@ -60,9 +64,10 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
         self.context = context
         self.certificate = certificate
         self.nodes = nodes
+        self.platform = platform
         self.apiCallObserver = apiCallObserver
         self.status = status
-        self.service = service ?? CertificateProvisioningService(context: context)
+        self.service = service ?? CertificateProvisioningService(context: context, platform: platform, profileValidator: profileValidator)
     }
 
     /// Read-only resource discovery for deterministic local-identity selection.
@@ -70,7 +75,7 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
     public static func availableCertificates(context: SigningContext) async throws -> [DeveloperServicesCertificate] {
         do {
             return try await ProvisioningAPICallObserver.$suppressResponseBodies.withValue(true) {
-                try await CertificateProvisioningService(context: context).certificates()
+                try await CertificateProvisioningService(context: context, platform: .iOS).certificates()
             }
         } catch {
             throw Self.safeError(error)
@@ -89,12 +94,22 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
         }
     }
 
-    private static func safeError(_ error: any Error) -> any Error {
+    static func safeError(_ error: any Error) -> any Error {
         if error is CancellationError || Task.isCancelled {
             return CancellationError()
         }
         if error is CertificateProvisioningError || error is DeveloperServicesFetchProfileOperation.Errors || error is DeveloperServicesAddDeviceOperation.Errors {
             return error
+        }
+        if let clientError = error as? ClientError, clientError.response?.status.code == 403 {
+            return CertificateProvisioningError.insufficientPermissions
+        }
+        let message = String(describing: error).lowercased()
+        if message.contains("403") || message.contains("forbidden") {
+            return CertificateProvisioningError.insufficientPermissions
+        }
+        if message.contains("no current") && message.contains("devices") {
+            return DeveloperServicesFetchProfileOperation.Errors.noRegisteredDevices(message.contains("mac") ? "macOS" : "iOS")
         }
         // OpenAPI ClientError can include authentication headers and raw bodies.
         // Keep these diagnostic objects inside the provisioning boundary.
@@ -121,7 +136,7 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
                 $0.relativePath != node.relativePath &&
                     ($0.relativePath == "." || node.relativePath.hasPrefix($0.relativePath + "/"))
             }.max { $0.relativePath.count < $1.relativePath.count }
-            if let parent, !node.finalBundleID.hasPrefix(parent.finalBundleID + ".") {
+            if platform == .iOS, let parent, !node.finalBundleID.hasPrefix(parent.finalBundleID + ".") {
                 throw CertificateProvisioningError.invalidRequest("A child identifier does not extend its parent identifier.")
             }
         }
@@ -138,7 +153,8 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
                 teamID: certificate.teamID,
                 originalBundleID: node.originalBundleID,
                 finalBundleID: node.finalBundleID,
-                context: context
+                context: context,
+                platform: platform
             )
             prepared.append((CertificateProvisioningNode(
                 relativePath: node.relativePath,
@@ -146,6 +162,14 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
                 finalBundleID: node.finalBundleID,
                 requestedEntitlements: normalized.entitlements
             ), normalized.removedEntitlementKeys))
+        }
+        if case .appStoreConnect = context.auth {
+            for (node, _) in prepared {
+                if let groups = try node.requestedEntitlements.entitlements().first(where: { $0 is AppGroupEntitlement }) as? AppGroupEntitlement,
+                   !groups.rawValue.isEmpty {
+                    throw CertificateProvisioningError.unsupportedAppGroupAuthentication
+                }
+            }
         }
         status("Registering the target device for certificate-only provisioning.")
         do {
@@ -196,6 +220,9 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
                     try await service.registerDevice()
                 } catch {
                     try Task.checkCancellation()
+                    if !Self.registrationCanPropagate(error) {
+                        throw error
+                    }
                 }
                 try await Task.sleep(for: .seconds(Double(attempt)))
             }
@@ -213,10 +240,17 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
             }
         }
         let message = String(describing: error).lowercased()
-        return message.contains("no current") && message.contains("devices") && message.contains("ios")
+        return message.contains("no current") && message.contains("devices")
     }
 
     private static func registrationCanPropagate(_ error: any Error) -> Bool {
+        if let clientError = error as? ClientError, clientError.response?.status.code == 403 {
+            return false
+        }
+        let diagnostic = String(describing: error).lowercased()
+        if diagnostic.contains("403") || diagnostic.contains("forbidden") {
+            return false
+        }
         if error is DeveloperServicesAddDeviceOperation.Errors {
             return true
         }
@@ -232,6 +266,13 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
 
 struct CertificateProvisioningService: CertificateProvisioningServing {
     let context: SigningContext
+    let platform: ProvisioningPlatform
+    var profileValidator: (@Sendable (Data, String) -> Bool)? = nil
+    var client: DeveloperAPIClient? = nil
+
+    private var apiClient: DeveloperAPIClient {
+        client ?? context.developerAPIClient
+    }
 
     func team() async throws -> (teamID: String?, isFree: Bool) {
         let team = try await context.auth.team()
@@ -245,7 +286,7 @@ struct CertificateProvisioningService: CertificateProvisioningServing {
 
     func certificates() async throws -> [DeveloperServicesCertificate] {
         let pages = DeveloperAPIPages {
-            try await context.developerAPIClient.certificatesGetCollection(query: .init(
+            try await apiClient.certificatesGetCollection(query: .init(
                 filter_lbrack_certificateType_rbrack_: [.development, .iosDevelopment],
                 fields_lbrack_certificates_rbrack_: [.certificateType, .expirationDate, .certificateContent, .activated]
             )).ok.body.json
@@ -261,7 +302,7 @@ struct CertificateProvisioningService: CertificateProvisioningServing {
     }
 
     func registerDevice() async throws {
-        try await DeveloperServicesAddDeviceOperation(context: context, platform: .iOS).perform()
+        try await DeveloperServicesAddDeviceOperation(context: context, platform: platform, useContextTargetDevice: true).perform()
     }
 
     func prepareApp(_ node: CertificateProvisioningNode) async throws -> String {
@@ -274,14 +315,14 @@ struct CertificateProvisioningService: CertificateProvisioningServing {
             originalBundleID: node.originalBundleID,
             newBundleID: node.finalBundleID,
             entitlements: node.requestedEntitlements,
-            platform: .iOS
+            platform: platform
         ).perform()
         if let groups, !groups.rawValue.isEmpty {
             guard let operation = DeveloperServicesAssignAppGroupsOperation(
                 context: context,
                 groupIDs: groups.rawValue,
                 appID: app,
-                platform: .iOS,
+                platform: platform,
                 preserveExactGroupIDs: true
             ) else {
                 throw CertificateProvisioningError.unsupportedAppGroupAuthentication
@@ -299,26 +340,36 @@ struct CertificateProvisioningService: CertificateProvisioningServing {
             throw CertificateProvisioningError.invalidRequest("The target device is missing.")
         }
         let pages = DeveloperAPIPages {
-            try await context.developerAPIClient.devicesGetCollection().ok.body.json
+            try await apiClient.devicesGetCollection(query: .init(
+                filter_lbrack_platform_rbrack_: [platform == .macOS ? .macOs : .ios],
+                filter_lbrack_udid_rbrack_: [deviceUDID],
+                filter_lbrack_status_rbrack_: [.enabled]
+            )).ok.body.json
         } next: {
             $0.links.next
         }
         var devices: [Components.Schemas.Device] = []
         for try await page in pages {
             devices += page.data.filter {
-                $0.attributes?.status?.value1 == .enabled && $0.attributes?.udid?.uppercased() == deviceUDID
+                $0.attributes?.status?.value1 == .enabled &&
+                    $0.attributes?.udid?.uppercased() == deviceUDID &&
+                    $0.attributes?.platform?.value1 == platform.bundleIDPlatform
             }
         }
         try Task.checkCancellation()
         guard devices.count == 1, let device = devices.first else {
-            throw DeveloperServicesFetchProfileOperation.Errors.noRegisteredDevices("iOS")
+            throw DeveloperServicesFetchProfileOperation.Errors.noRegisteredDevices(platform.displayName)
+        }
+        if let existing = try await reusableProfile(bundleResourceID: bundleResourceID, bundleID: bundleID, certificateResourceID: certificateResourceID, device: device) {
+            return existing
         }
         let name = "Xogot development \(bundleID) \(UUID().uuidString)"
-        let response = try await context.developerAPIClient.profilesCreateInstance(body: .json(Self.profileRequest(
+        let response = try await apiClient.profilesCreateInstance(body: .json(Self.profileRequest(
             name: name,
             bundleResourceID: bundleResourceID,
             certificateResourceID: certificateResourceID,
-            deviceResourceID: device.id
+            deviceResourceID: device.id,
+            platform: platform
         )))
         let profile: Components.Schemas.Profile
         do {
@@ -346,10 +397,43 @@ struct CertificateProvisioningService: CertificateProvisioningServing {
         return CertificateProvisioningProfile(resourceID: profile.id, name: returnedName, data: data)
     }
 
-    static func profileRequest(name: String, bundleResourceID: String, certificateResourceID: String, deviceResourceID: String) -> Components.Schemas.ProfileCreateRequest {
+    private func reusableProfile(bundleResourceID: String, bundleID: String, certificateResourceID: String, device: Components.Schemas.Device) async throws -> CertificateProvisioningProfile? {
+        guard let profileValidator else {
+            return nil
+        }
+        let pages = DeveloperAPIPages {
+            try await apiClient.profilesGetCollection(query: .init(
+                filter_lbrack_profileType_rbrack_: [platform == .macOS ? .macAppDevelopment : .iosAppDevelopment],
+                filter_lbrack_profileState_rbrack_: [.active],
+                include: [.bundleId, .devices, .certificates]
+            )).ok.body.json
+        } next: {
+            $0.links.next
+        }
+        for try await page in pages {
+            for profile in page.data {
+                guard profile.attributes?.profileState?.value1 == .active,
+                      profile.attributes?.profileType?.value1?.rawValue == platform.profileType.rawValue,
+                      let expiration = profile.attributes?.expirationDate, expiration > Date(),
+                      profile.relationships?.bundleId?.data?.id == bundleResourceID,
+                      profile.relationships?.certificates?.data?.map(\.id) == [certificateResourceID],
+                      profile.relationships?.devices?.data?.contains(where: { $0.id == device.id }) == true,
+                      let name = profile.attributes?.name,
+                      let content = profile.attributes?.profileContent,
+                      let data = Data(base64Encoded: content),
+                      profileValidator(data, bundleID) else {
+                    continue
+                }
+                return CertificateProvisioningProfile(resourceID: profile.id, name: name, data: data)
+            }
+        }
+        return nil
+    }
+
+    static func profileRequest(name: String, bundleResourceID: String, certificateResourceID: String, deviceResourceID: String, platform: ProvisioningPlatform = .iOS) -> Components.Schemas.ProfileCreateRequest {
         .init(data: .init(
             _type: .profiles,
-            attributes: .init(name: name, profileType: .init(.iosAppDevelopment)),
+            attributes: .init(name: name, profileType: .init(platform.profileType)),
             relationships: .init(
                 bundleId: .init(data: .init(_type: .bundleIds, id: bundleResourceID)),
                 devices: .init(data: [.init(_type: .devices, id: deviceResourceID)]),
