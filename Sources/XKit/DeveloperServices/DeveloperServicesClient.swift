@@ -113,7 +113,7 @@ public struct DeveloperServicesClient: Sendable {
     }
 
     public func send<R: DeveloperServicesRequest>(_ request: R) async throws -> R.Value {
-        let anisetteData = try await anisetteDataProvider.fetchAnisetteData()
+        let anisetteData = try await AnisetteServerRetry.fetch(from: anisetteDataProvider)
         return try await self.send(request, anisetteData: anisetteData)
     }
 

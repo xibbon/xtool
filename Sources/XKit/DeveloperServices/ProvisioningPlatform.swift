@@ -84,4 +84,37 @@ public enum ProvisioningPlatform: Sendable {
             return deviceClass == .mac
         }
     }
+
+    /// Selects the record of the device with `udid`.
+    ///
+    /// Apple's device records do not always use the values of the API spec. For an
+    /// Apple silicon Mac, Apple returns the platform "MACOS" and the device class
+    /// "APPLE_SILICON_MAC". Thus the UDID selects the record. If Apple has more than
+    /// one record for the UDID, the record for this platform is used.
+    func deviceRecord(
+        withUDID udid: String,
+        in devices: [Components.Schemas.Device]
+    ) -> Components.Schemas.Device? {
+        let normalizedUDID = udid.uppercased()
+        let matches = devices.filter { $0.attributes?.udid?.uppercased() == normalizedUDID }
+        guard matches.count > 1 else {
+            return matches.first
+        }
+        return matches.first { supports(recordPlatform: $0.attributes?.platform) } ?? matches.first
+    }
+
+    /// True when the platform of a device record is this platform or UNIVERSAL.
+    /// Apple sends "MACOS" as well as the spec value "MAC_OS".
+    func supports(recordPlatform: Components.Schemas.BundleIdPlatform?) -> Bool {
+        guard let name = recordPlatform?.value2 ?? recordPlatform?.value1?.rawValue else {
+            return false
+        }
+        let normalizedName = name.uppercased().replacingOccurrences(of: "_", with: "")
+        switch self {
+        case .iOS:
+            return normalizedName == "IOS" || normalizedName == "UNIVERSAL"
+        case .macOS:
+            return normalizedName == "MACOS" || normalizedName == "UNIVERSAL"
+        }
+    }
 }

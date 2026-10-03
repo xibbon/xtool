@@ -11,18 +11,29 @@ private let server = URL(string: "https://anisette.example")!
 private let machineID = "TUFDSElORS1JRC1TRUNSRVQ="
 private let oneTimePassword = "T05FLVRJTUUtU0VDUkVU"
 
-/// Gives one fixed reply to each anisette request, and counts the requests.
+private let validHeaders = """
+    {"result":"Headers","X-Apple-I-MD":"\(oneTimePassword)","X-Apple-I-MD-M":"\(machineID)","X-Apple-I-MD-RINFO":"17106176"}
+    """
+
+private struct Reply: Sendable {
+    let status: Int
+    let contentType: String?
+    let body: String
+}
+
+/// Gives the replies in sequence to the requests, and records the request paths.
+/// After the last reply, it gives the last reply again.
 private final class FakeAnisetteServer: HTTPClientProtocol, ClientTransport, @unchecked Sendable {
-    private let status: Int
-    private let contentType: String?
-    private let body: String
+    private let replies: [Reply]
     private let lock = NSLock()
     private var paths: [String] = []
 
     init(status: Int, contentType: String?, body: String) {
-        self.status = status
-        self.contentType = contentType
-        self.body = body
+        self.replies = [Reply(status: status, contentType: contentType, body: body)]
+    }
+
+    init(replies: [Reply]) {
+        self.replies = replies
     }
 
     var requestPaths: [String] {
@@ -37,14 +48,15 @@ private final class FakeAnisetteServer: HTTPClientProtocol, ClientTransport, @un
         baseURL: URL,
         operationID: String
     ) async throws -> (HTTPResponse, HTTPBody?) {
-        lock.withLock {
+        let reply = lock.withLock {
             paths.append(request.path ?? "")
+            return replies[min(paths.count, replies.count) - 1]
         }
-        var response = HTTPResponse(status: .init(code: status))
-        if let contentType {
+        var response = HTTPResponse(status: .init(code: reply.status))
+        if let contentType = reply.contentType {
             response.headerFields[.contentType] = contentType
         }
-        return (response, HTTPBody(self.body))
+        return (response, HTTPBody(reply.body))
     }
 
     func makeWebSocket(url: URL) async throws -> any WebSocketSession {
@@ -62,7 +74,18 @@ private func withAnisetteServer<T>(
     try storage.setString(UUID().uuidString, forKey: "XTLLocalUserUID")
     try storage.setData(Data("stored ADI state".utf8), forKey: "XTLProvisioningInfo")
     try storage.setString("17106176", forKey: "XTLRoutingInfo")
-    return try await withDependencies {
+    // The tests check the number of attempts, not the delays.
+    return try await AnisetteServerRetry.$delays.withValue([.zero, .zero, .zero]) {
+        try await withAnisetteDependencies(fake, storage: storage, operation: operation)
+    }
+}
+
+private func withAnisetteDependencies<T>(
+    _ fake: FakeAnisetteServer,
+    storage: MemoryKeyValueStorage,
+    operation: () async throws -> T
+) async throws -> T {
+    try await withDependencies {
         $0.httpClient = fake
         $0.keyValueStorage = storage
         $0.rawADIProvider = OmnisetteADIProvider(url: server)
@@ -126,9 +149,7 @@ private func expectNoReplyValues(_ message: String) {
 
 struct OmnisetteADIProviderTests {
     @Test func validHeadersReturnAnisetteData() async throws {
-        let fake = FakeAnisetteServer(status: 200, contentType: "application/json", body: """
-            {"result":"Headers","X-Apple-I-MD":"\(oneTimePassword)","X-Apple-I-MD-M":"\(machineID)","X-Apple-I-MD-RINFO":"17106176"}
-            """)
+        let fake = FakeAnisetteServer(status: 200, contentType: "application/json", body: validHeaders)
         let data = try await withAnisetteServer(fake) {
             try await ADIDataProvider().fetchAnisetteData()
         }
@@ -156,7 +177,39 @@ struct OmnisetteADIProviderTests {
             #expect(message.contains("502"))
             #expect(!message.contains("Bad Gateway"))
         }
-        #expect(fake.requestPaths.count == 3)
+        // One attempt and three retries.
+        #expect(fake.requestPaths.count == 4)
+    }
+
+    @Test func retryWaitsOneTwoAndFourSeconds() {
+        #expect(AnisetteServerRetry.delays == [.seconds(1), .seconds(2), .seconds(4)])
+    }
+
+    @Test func serverFailureForSomeSecondsRecovers() async throws {
+        let badGateway = Reply(status: 502, contentType: "text/html", body: "<html>502 Bad Gateway</html>")
+        let headers = Reply(status: 200, contentType: "application/json", body: validHeaders)
+        let fake = FakeAnisetteServer(replies: [badGateway, badGateway, badGateway, headers])
+        let appleRequests = try await withAnisetteServer(fake) {
+            try await sendThroughMiddleware()
+        }
+        #expect(appleRequests == 1)
+        #expect(fake.requestPaths.count == 4)
+    }
+
+    @Test func developerServicesClientRetriesServerFailure() async throws {
+        let fake = FakeAnisetteServer(status: 503, contentType: "text/html", body: "<html>503</html>")
+        do {
+            _ = try await withAnisetteServer(fake) {
+                let token = DeveloperServicesLoginToken(adsid: "ADSID", token: "GS-TOKEN", expiry: .distantFuture)
+                return try await DeveloperServicesClient(loginToken: token).send(DeveloperServicesListTeamsRequest())
+            }
+            Issue.record("Expected an anisette server error")
+        } catch let error as OmnisetteError {
+            #expect(error.localizedDescription.contains(server.absoluteString))
+            #expect(error.localizedDescription.contains("503"))
+        }
+        // No request went to Apple.
+        #expect(fake.requestPaths == Array(repeating: "/v3/get_headers", count: 4))
     }
 
     @Test func emptyReplyIsNotAnisetteDataAndIsRetried() async throws {
@@ -172,7 +225,7 @@ struct OmnisetteADIProviderTests {
             #expect(message.contains("not anisette data"))
             #expect(message.contains("HTTP 200"))
         }
-        #expect(fake.requestPaths.count == 3)
+        #expect(fake.requestPaths.count == 4)
     }
 
     @Test func serverErrorObjectGivesServerMessageAndIsNotRetried() async throws {

@@ -147,14 +147,46 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
             typeName = "\(nsError.domain) \(nsError.code)"
         }
         // An OpenAPIRuntime error describes the whole response, with its header fields.
-        // Keep only the HTTP status from it.
+        // Keep only Apple's error objects or the HTTP status from it.
         if qualifiedName.hasPrefix("OpenAPIRuntime.") {
+            let appleErrors = appleErrors(in: error)
+            if !appleErrors.isEmpty {
+                return "\(typeName): Apple returned \(appleErrors.map(describe).joined(separator: "; "))"
+            }
             guard let status = undocumentedStatus(in: String(describing: error)) else {
                 return typeName
             }
             return "\(typeName): unexpected HTTP status \(status)"
         }
         return "\(typeName): \(error.localizedDescription)"
+    }
+
+    /// Finds Apple's error objects in a reply that the `ok` accessor rejected, for
+    /// example a decoded HTTP 400 reply. The reply is an internal value of the
+    /// OpenAPIRuntime error, so a Mirror finds it.
+    static func appleErrors(in value: Any, depth: Int = 0) -> [Components.Schemas.ErrorResponse.ErrorsPayloadPayload] {
+        if let response = value as? Components.Schemas.ErrorResponse {
+            return response.errors ?? []
+        }
+        guard depth < 8 else {
+            return []
+        }
+        for child in Mirror(reflecting: value).children {
+            let errors = appleErrors(in: child.value, depth: depth + 1)
+            if !errors.isEmpty {
+                return errors
+            }
+        }
+        return []
+    }
+
+    /// Uses only status, code, title, detail, and the name of the rejected parameter.
+    private static func describe(_ error: Components.Schemas.ErrorResponse.ErrorsPayloadPayload) -> String {
+        var text = "HTTP \(error.status) \(error.code): \(error.title). \(error.detail)"
+        if case .ErrorSourceParameter(let source) = error.source {
+            text += " (parameter \(source.parameter))"
+        }
+        return text
     }
 
     /// Finds the status of an undocumented response, for example
@@ -336,10 +368,13 @@ struct CertificateProvisioningService: CertificateProvisioningServing {
     }
 
     func certificates() async throws -> [DeveloperServicesCertificate] {
+        // With an Xcode login, Apple rejects fields[certificates]: "A parameter
+        // 'fields[certificates]' has an invalid value : ''activated' does not exist.'"
+        // (PARAMETER_ERROR.INVALID). Without fields, both an Xcode login and an App
+        // Store Connect key return certificateContent and expirationDate.
         let pages = DeveloperAPIPages {
             try await apiClient.certificatesGetCollection(query: .init(
-                filter_lbrack_certificateType_rbrack_: [.development, .iosDevelopment],
-                fields_lbrack_certificates_rbrack_: [.certificateType, .expirationDate, .certificateContent, .activated]
+                filter_lbrack_certificateType_rbrack_: [.development, .iosDevelopment]
             )).ok.body.json
         } next: {
             $0.links.next
@@ -353,7 +388,7 @@ struct CertificateProvisioningService: CertificateProvisioningServing {
     }
 
     func registerDevice() async throws {
-        try await DeveloperServicesAddDeviceOperation(context: context, platform: platform, useContextTargetDevice: true).perform()
+        try await DeveloperServicesAddDeviceOperation(context: context, platform: platform, useContextTargetDevice: true, client: client).perform()
     }
 
     func prepareApp(_ node: CertificateProvisioningNode) async throws -> String {
@@ -390,9 +425,10 @@ struct CertificateProvisioningService: CertificateProvisioningServing {
         guard let deviceUDID = context.targetDevice?.udid.uppercased() else {
             throw CertificateProvisioningError.invalidRequest("The target device is missing.")
         }
+        // The UDID selects the device. Apple's records do not always use the spec's
+        // platform values, see ProvisioningPlatform.deviceRecord(withUDID:in:).
         let pages = DeveloperAPIPages {
             try await apiClient.devicesGetCollection(query: .init(
-                filter_lbrack_platform_rbrack_: [platform == .macOS ? .macOs : .ios],
                 filter_lbrack_udid_rbrack_: [deviceUDID],
                 filter_lbrack_status_rbrack_: [.enabled]
             )).ok.body.json
@@ -402,13 +438,11 @@ struct CertificateProvisioningService: CertificateProvisioningServing {
         var devices: [Components.Schemas.Device] = []
         for try await page in pages {
             devices += page.data.filter {
-                $0.attributes?.status?.value1 == .enabled &&
-                    $0.attributes?.udid?.uppercased() == deviceUDID &&
-                    $0.attributes?.platform?.value1 == platform.bundleIDPlatform
+                $0.attributes?.status?.value1 == .enabled
             }
         }
         try Task.checkCancellation()
-        guard devices.count == 1, let device = devices.first else {
+        guard let device = platform.deviceRecord(withUDID: deviceUDID, in: devices) else {
             throw DeveloperServicesFetchProfileOperation.Errors.noRegisteredDevices(platform.displayName)
         }
         if let existing = try await reusableProfile(bundleResourceID: bundleResourceID, bundleID: bundleID, certificateResourceID: certificateResourceID, device: device) {

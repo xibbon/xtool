@@ -150,9 +150,9 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
         request.headerFields[.init("X-Apple-I-Identity-Id")!] = authData.loginToken.adsid
         request.headerFields[.init("X-Apple-GS-Token")!] = authData.loginToken.token
 
-        // Anisette
+        // Anisette. AnisetteServerRetry retries the failures of the anisette server.
         let anisetteData = try await retrying {
-            try await anisetteDataProvider.fetchAnisetteData()
+            try await AnisetteServerRetry.fetch(from: anisetteDataProvider)
         }
         for (key, value) in anisetteData.dictionary {
             request.headerFields[.init(key)!] = value
@@ -247,8 +247,9 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
     }
 
     private func shouldRetry(_ error: Error) -> Bool {
-        if let omnisetteError = error as? OmnisetteError {
-            return omnisetteError.isTransient
+        if error is OmnisetteError {
+            // AnisetteServerRetry retried it already, with longer delays.
+            return false
         }
 
         if let decodingError = error as? DecodingError {

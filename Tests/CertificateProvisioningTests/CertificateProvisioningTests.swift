@@ -131,7 +131,7 @@ struct CertificateProvisioningTests {
             #expect(profile.resourceID == "existing-profile")
         }
         #expect(await transport.operations == ["devices_getCollection", "profiles_getCollection", "devices_getCollection", "profiles_getCollection"])
-        #expect(await transport.deviceQueries.allSatisfy { $0.contains("filter%5Budid%5D=TARGET-UDID") && $0.contains("MAC_OS") })
+        #expect(await transport.deviceQueries.allSatisfy { $0.contains("filter%5Budid%5D=TARGET-UDID") && !$0.contains("platform") })
     }
 
     @Test func expiredOrMismatchedMacProfilesDoNotReuse() async throws {
@@ -332,6 +332,185 @@ private final class Counter: @unchecked Sendable {
     }
 }
 
+// The record that Apple returned for an Apple silicon Mac on 2026-10-02.
+private let appleSiliconMacUDID = "00006032-001251A01A04801C"
+private func appleSiliconMacRecord(status: String = "ENABLED") -> [String: Any] {
+    [
+        "type": "devices",
+        "id": "mac",
+        "attributes": [
+            "name": "SECRET-NAME",
+            "udid": appleSiliconMacUDID,
+            "platform": "MACOS",
+            "status": status,
+            "deviceClass": "APPLE_SILICON_MAC",
+        ],
+    ]
+}
+
+private func appleSiliconMacContext() throws -> SigningContext {
+    _ = registerTestSigner
+    return try SigningContext(auth: .xcode(.init(
+        loginToken: .init(adsid: "test", token: "not-a-real-token", expiry: .distantFuture),
+        teamID: .init(rawValue: "TEAM")
+    )), targetDevice: .init(udid: appleSiliconMacUDID, name: "Fixture"))
+}
+
+private func testClient(_ transport: any ClientTransport) -> DeveloperAPIClient {
+    DeveloperAPIClient(serverURL: URL(string: "https://example.invalid")!, configuration: .init(dateTranscoder: .iso8601WithFractionalSeconds), transport: transport)
+}
+
+private func jsonReply(_ status: Int, _ object: Any) throws -> (HTTPResponse, HTTPBody?) {
+    var response = HTTPResponse(status: .init(code: status))
+    response.headerFields[.contentType] = "application/json"
+    response.headerFields[HTTPField.Name("X-Test-Secret")!] = "SECRET-HEADER"
+    return (response, HTTPBody(try JSONSerialization.data(withJSONObject: object)))
+}
+
+/// Gives the device lists in sequence, and the last list again after that. Each
+/// list gives the status of the Mac record, or is empty when Apple has no record.
+private actor DeviceRegistrationTransport: ClientTransport {
+    let collections: [[String]]
+    let createStatus: Int
+    var operations: [String] = []
+    var deviceQueries: [String] = []
+
+    init(collections: [[String]], createStatus: Int = 201) {
+        self.collections = collections
+        self.createStatus = createStatus
+    }
+
+    func send(_ request: HTTPRequest, body: HTTPBody?, baseURL: URL, operationID: String) async throws -> (HTTPResponse, HTTPBody?) {
+        operations.append(operationID)
+        switch operationID {
+        case "devices_getCollection":
+            deviceQueries.append(request.path ?? "")
+            let count = operations.filter { $0 == "devices_getCollection" }.count
+            let devices = collections[min(count, collections.count) - 1].map { appleSiliconMacRecord(status: $0) }
+            return try jsonReply(200, ["data": devices, "links": ["self": "https://example.invalid/v1/devices"]])
+        case "devices_createInstance":
+            if createStatus == 409 {
+                return try jsonReply(409, ["errors": [["status": "409", "code": "ENTITY_ERROR.ATTRIBUTE.INVALID", "title": "An attribute value is invalid.", "detail": "A device with number already exists on this team."]]])
+            }
+            return try jsonReply(201, ["data": appleSiliconMacRecord(), "links": ["self": "https://example.invalid/v1/devices"]])
+        default:
+            struct UnexpectedRequest: Error {}
+            throw UnexpectedRequest()
+        }
+    }
+}
+
+private actor CertificateQueryTransport: ClientTransport {
+    let rejectWithBadRequest: Bool
+    var queries: [[URLQueryItem]] = []
+
+    init(rejectWithBadRequest: Bool = false) {
+        self.rejectWithBadRequest = rejectWithBadRequest
+    }
+
+    func send(_ request: HTTPRequest, body: HTTPBody?, baseURL: URL, operationID: String) async throws -> (HTTPResponse, HTTPBody?) {
+        #expect(operationID == "certificates_getCollection")
+        queries.append(URLComponents(string: request.path ?? "")?.queryItems ?? [])
+        if rejectWithBadRequest {
+            return try jsonReply(400, ["errors": [[
+                "status": "400",
+                "code": "PARAMETER_ERROR.INVALID",
+                "title": "A parameter has an invalid value",
+                "detail": "A parameter 'fields[certificates]' has an invalid value : ''activated' does not exist.'",
+                "source": ["parameter": "fields[certificates]"],
+                "meta": ["secret": "SECRET-META"],
+            ]]])
+        }
+        return try jsonReply(200, ["data": [], "links": ["self": "https://example.invalid/v1/certificates"]])
+    }
+}
+
+struct AppleRecordFormatTests {
+    @Test func certificateQueryHasTheTypeFilterAndNoFields() async throws {
+        let transport = CertificateQueryTransport()
+        let service = CertificateProvisioningService(context: try appleSiliconMacContext(), platform: .macOS, client: testClient(transport))
+        _ = try await service.certificates()
+        let queries = await transport.queries
+        #expect(queries.count == 1)
+        let items = queries.first ?? []
+        #expect(items.first { $0.name == "filter[certificateType]" }?.value == "DEVELOPMENT,IOS_DEVELOPMENT")
+        #expect(!items.contains { $0.name.hasPrefix("fields") })
+    }
+
+    @Test func appleErrorObjectIsInTheSafeDetail() async throws {
+        let transport = CertificateQueryTransport(rejectWithBadRequest: true)
+        let service = CertificateProvisioningService(context: try appleSiliconMacContext(), platform: .macOS, client: testClient(transport))
+        do {
+            _ = try await service.certificates()
+            Issue.record("Expected HTTP 400")
+        } catch {
+            let message = DeveloperServicesCertificateProvisioningOperation.safeError(error).localizedDescription
+            #expect(message.contains("HTTP 400 PARAMETER_ERROR.INVALID: A parameter has an invalid value."))
+            #expect(message.contains("''activated' does not exist.'"))
+            #expect(message.contains("(parameter fields[certificates])"))
+            #expect(!message.contains("SECRET-HEADER"))
+            #expect(!message.contains("SECRET-META"))
+        }
+    }
+
+    @Test func registeredAppleSiliconMacPassesWithOneQuery() async throws {
+        let transport = DeviceRegistrationTransport(collections: [["ENABLED"]])
+        try await DeveloperServicesAddDeviceOperation(context: try appleSiliconMacContext(), platform: .macOS, useContextTargetDevice: true, client: testClient(transport)).perform()
+        #expect(await transport.operations == ["devices_getCollection"])
+        let query = await transport.deviceQueries.first ?? ""
+        #expect(query.contains("filter%5Budid%5D=\(appleSiliconMacUDID)"))
+        #expect(!query.contains("platform"))
+    }
+
+    @Test func newMacIsRegisteredAndTheStepWaitsForIt() async throws {
+        let transport = DeviceRegistrationTransport(collections: [[], [], ["ENABLED"]])
+        try await DeveloperServicesAddDeviceOperation.$waitPolicy.withValue(.init(delay: .zero)) {
+            try await DeveloperServicesAddDeviceOperation(context: try appleSiliconMacContext(), platform: .macOS, useContextTargetDevice: true, client: testClient(transport)).perform()
+        }
+        #expect(await transport.operations == ["devices_getCollection", "devices_createInstance", "devices_getCollection", "devices_getCollection"])
+    }
+
+    @Test func conflictWaitsOnlyAShortTimeAndListsTheRecords() async throws {
+        let transport = DeviceRegistrationTransport(collections: [[], ["PROCESSING"]], createStatus: 409)
+        do {
+            try await DeveloperServicesAddDeviceOperation.$waitPolicy.withValue(.init(delay: .zero)) {
+                try await DeveloperServicesAddDeviceOperation(context: try appleSiliconMacContext(), platform: .macOS, useContextTargetDevice: true, client: testClient(transport)).perform()
+            }
+            Issue.record("Expected deviceNotAvailable")
+        } catch let error as DeveloperServicesAddDeviceOperation.Errors {
+            let message = error.localizedDescription
+            #expect(message.contains("udid=\(appleSiliconMacUDID) platform=MACOS status=PROCESSING deviceClass=APPLE_SILICON_MAC"))
+            #expect(!message.contains("SECRET-NAME"))
+        }
+        // One lookup, the create that gets HTTP 409, then three short checks.
+        #expect(await transport.operations == ["devices_getCollection", "devices_createInstance", "devices_getCollection", "devices_getCollection", "devices_getCollection"])
+    }
+
+    @Test func profileStepSelectsTheMacByUDID() async throws {
+        let fixture = try Fixture()
+        let transport = try ProfileReuseTransport(devicePlatform: "MACOS")
+        let service = CertificateProvisioningService(context: try fixture.context(), platform: .macOS, profileValidator: { data, bundleID in
+            data == Data("authorized fixture".utf8) && bundleID == "com.example.game"
+        }, client: testClient(transport))
+        let profile = try await service.createProfile(bundleResourceID: "app", bundleID: "com.example.game", certificateResourceID: "certificate")
+        #expect(profile.resourceID == "existing-profile")
+        #expect(await transport.deviceQueries.allSatisfy { $0.contains("filter%5Bstatus%5D=ENABLED") })
+    }
+
+    @Test func recordPlatformNamesIncludeApplesMacValue() {
+        typealias RecordPlatform = Components.Schemas.BundleIdPlatform
+        let appleMac = RecordPlatform(value2: "MACOS")
+        let specMac = RecordPlatform(value1: .macOs)
+        let universal = RecordPlatform(value2: "UNIVERSAL")
+        let iOS = RecordPlatform(value2: "IOS")
+        #expect(ProvisioningPlatform.macOS.supports(recordPlatform: appleMac))
+        #expect(ProvisioningPlatform.macOS.supports(recordPlatform: specMac))
+        #expect(ProvisioningPlatform.macOS.supports(recordPlatform: universal))
+        #expect(ProvisioningPlatform.macOS.supports(recordPlatform: iOS) == false)
+        #expect(ProvisioningPlatform.iOS.supports(recordPlatform: iOS))
+    }
+}
+
 private struct Fixture {
     let certificate: ProvisioningCertificate
 
@@ -439,7 +618,10 @@ private actor ProfileReuseTransport: ClientTransport {
     var operations: [String] = []
     var deviceQueries: [String] = []
 
-    init(mismatch: String = "") throws {
+    let devicePlatform: String
+
+    init(mismatch: String = "", devicePlatform: String = "MAC_OS") throws {
+        self.devicePlatform = devicePlatform
         let profile: [String: Any] = [
             "type": "profiles",
             "id": "existing-profile",
@@ -466,7 +648,7 @@ private actor ProfileReuseTransport: ClientTransport {
         switch operationID {
         case "devices_getCollection":
             deviceQueries.append(request.path ?? "")
-            let device: [String: Any] = ["type": "devices", "id": "mac", "attributes": ["platform": "MAC_OS", "udid": "TARGET-UDID", "status": "ENABLED"]]
+            let device: [String: Any] = ["type": "devices", "id": "mac", "attributes": ["platform": devicePlatform, "udid": "TARGET-UDID", "status": "ENABLED"]]
             let data = try JSONSerialization.data(withJSONObject: ["data": [device], "links": ["self": "https://example.invalid/v1/devices"]])
             return (response, HTTPBody(data))
         case "profiles_getCollection":
