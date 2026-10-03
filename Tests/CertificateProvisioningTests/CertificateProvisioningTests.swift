@@ -165,6 +165,68 @@ struct CertificateProvisioningTests {
         #expect(!devices.localizedDescription.contains("secret"))
     }
 
+    @Test func requestFailedKeepsSafeCauseWithoutSecrets() {
+        var request = HTTPRequest(method: .get, scheme: "https", authority: "developerservices2.apple.com", path: "/services/v1/certificates")
+        request.headerFields[HTTPField.Name("X-Apple-GS-Token")!] = "SECRET-TOKEN"
+        let decoding = DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "SECRET-DEBUG"))
+        let clientError = ClientError(
+            operationID: "certificates_getCollection",
+            operationInput: "SECRET-INPUT",
+            request: request,
+            requestBody: HTTPBody("SECRET-REQUEST-BODY"),
+            baseURL: URL(string: "https://developerservices2.apple.com/services"),
+            response: HTTPResponse(status: .ok),
+            responseBody: HTTPBody("SECRET-BODY"),
+            causeDescription: "Middleware of type 'DeveloperAPIXcodeAuthMiddleware' threw an error.",
+            underlyingError: decoding
+        )
+        let error = DeveloperServicesCertificateProvisioningOperation.safeError(clientError)
+        guard case CertificateProvisioningError.requestFailed(let detail?) = error else {
+            Issue.record("Expected requestFailed with a detail: \(error)")
+            return
+        }
+        let message = error.localizedDescription
+        #expect(detail.contains("certificates_getCollection"))
+        #expect(message.contains("certificates_getCollection"))
+        #expect(message.contains("HTTP 200"))
+        #expect(message.contains("Middleware of type 'DeveloperAPIXcodeAuthMiddleware' threw an error."))
+        #expect(message.contains(decoding.localizedDescription))
+        #expect(message.contains("No certificate or existing profile was deleted."))
+        for secret in ["SECRET-TOKEN", "SECRET-BODY", "SECRET-REQUEST-BODY", "SECRET-INPUT", "SECRET-DEBUG"] {
+            #expect(!message.contains(secret))
+        }
+        #expect(CertificateProvisioningError.requestFailed(detail: nil).localizedDescription == "Apple Developer services could not complete certificate-only provisioning. No certificate or existing profile was deleted.")
+    }
+
+    @Test func anisetteFailureIsNotMappedToAppleGuidance() {
+        let anisette = OmnisetteError.httpStatus(server: URL(string: "https://ani.sidestore.io")!, status: 403)
+        let clientError = ClientError(
+            operationID: "certificates_getCollection",
+            operationInput: "input",
+            causeDescription: "Middleware of type 'DeveloperAPIXcodeAuthMiddleware' threw an error.",
+            underlyingError: anisette
+        )
+        let error = DeveloperServicesCertificateProvisioningOperation.safeError(clientError)
+        guard case CertificateProvisioningError.requestFailed = error else {
+            Issue.record("Expected requestFailed: \(error)")
+            return
+        }
+        #expect(error.localizedDescription.contains("certificates_getCollection"))
+        #expect(error.localizedDescription.contains("https://ani.sidestore.io"))
+        #expect(error.localizedDescription.contains("403"))
+    }
+
+    @Test func otherErrorsKeepOnlyTypeAndDescription() {
+        struct OpaqueError: Error, CustomStringConvertible {
+            let description = "SECRET-DESCRIPTION"
+        }
+        let opaque = DeveloperServicesCertificateProvisioningOperation.safeError(OpaqueError())
+        #expect(opaque.localizedDescription.contains("OpaqueError"))
+        #expect(!opaque.localizedDescription.contains("SECRET-DESCRIPTION"))
+        let timeout = DeveloperServicesCertificateProvisioningOperation.safeError(URLError(.timedOut))
+        #expect(timeout.localizedDescription.contains("NSURLErrorDomain -1001: \(URLError(.timedOut).localizedDescription)"))
+    }
+
     @Test func createsReplacementWithoutDeletingExistingProfilesAndPreparesWholeGraphFirst() async throws {
         let fixture = try Fixture()
         let context = try fixture.context()

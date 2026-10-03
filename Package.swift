@@ -149,6 +149,15 @@ let package = Package(
             ]
         ),
         .testTarget(
+            name: "AnisetteTests",
+            dependencies: [
+                "XKit",
+                .product(name: "Dependencies", package: "swift-dependencies"),
+                .product(name: "HTTPTypes", package: "swift-http-types"),
+                .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
+            ]
+        ),
+        .testTarget(
             name: "XToolTests",
             dependencies: [
                 "XToolSupport",

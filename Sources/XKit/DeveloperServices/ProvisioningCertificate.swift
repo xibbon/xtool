@@ -59,7 +59,9 @@ public enum CertificateProvisioningError: LocalizedError, Sendable {
     case certificateMatchCount(Int)
     case profileLimitRequiresDecision(bundleID: String)
     case invalidProfileResponse
-    case requestFailed
+    /// `detail` contains only safe facts: the operation, the HTTP status, and the
+    /// failure text. It is nil when no safe facts are available.
+    case requestFailed(detail: String?)
     case insufficientPermissions
     case unsupportedAppGroupAuthentication
 
@@ -75,8 +77,11 @@ public enum CertificateProvisioningError: LocalizedError, Sendable {
             return "Apple could not create a replacement profile for \(bundleID) because of a profile limit. No profile was deleted. Select an exact old profile to remove before retrying."
         case .insufficientPermissions:
             return "The App Store Connect API key does not have permission to manage signing resources. Use a key with the Admin or App Manager role, or sign in with your Apple Developer account."
-        case .requestFailed:
-            return "Apple Developer services could not complete certificate-only provisioning. No certificate or existing profile was deleted."
+        case .requestFailed(let detail):
+            guard let detail else {
+                return "Apple Developer services could not complete certificate-only provisioning. No certificate or existing profile was deleted."
+            }
+            return "Apple Developer services could not complete certificate-only provisioning (\(detail)). No certificate or existing profile was deleted."
         case .invalidProfileResponse:
             return "Apple returned an invalid development profile response."
         case .unsupportedAppGroupAuthentication:

@@ -101,6 +101,11 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
         if error is CertificateProvisioningError || error is DeveloperServicesFetchProfileOperation.Errors || error is DeveloperServicesAddDeviceOperation.Errors {
             return error
         }
+        // The anisette server failed before the request went to Apple. Its status and
+        // text are not Apple's, so the 403 and device mappings below do not apply.
+        if error is OmnisetteError || (error as? ClientError)?.underlyingError is OmnisetteError {
+            return CertificateProvisioningError.requestFailed(detail: safeDetail(error))
+        }
         if let clientError = error as? ClientError, clientError.response?.status.code == 403 {
             return CertificateProvisioningError.insufficientPermissions
         }
@@ -112,8 +117,54 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
             return DeveloperServicesFetchProfileOperation.Errors.noRegisteredDevices(message.contains("mac") ? "macOS" : "iOS")
         }
         // OpenAPI ClientError can include authentication headers and raw bodies.
-        // Keep these diagnostic objects inside the provisioning boundary.
-        return CertificateProvisioningError.requestFailed
+        // Keep these diagnostic objects inside the provisioning boundary. Report only
+        // the safe detail: the operation, the HTTP status, and the failure text.
+        return CertificateProvisioningError.requestFailed(detail: safeDetail(error))
+    }
+
+    /// Builds a description from safe facts only. It never uses `String(describing:)`
+    /// of a ClientError, its request, request body, header fields, response body,
+    /// or operation input.
+    static func safeDetail(_ error: any Error) -> String {
+        guard let clientError = error as? ClientError else {
+            return safeSummary(error)
+        }
+        var operation = clientError.operationID
+        if let status = clientError.response?.status.code {
+            operation += ", HTTP \(status)"
+        }
+        return "\(operation): \(clientError.causeDescription) \(safeSummary(clientError.underlyingError))"
+    }
+
+    /// The type name and the localized description of an error.
+    private static func safeSummary(_ error: any Error) -> String {
+        let qualifiedName = String(reflecting: type(of: error))
+        var typeName = qualifiedName.split(separator: ".", maxSplits: 1).last.map(String.init) ?? qualifiedName
+        // Bridged errors, such as URLError, have the type NSError. Their domain and
+        // code identify them better.
+        if type(of: error) is NSError.Type {
+            let nsError = error as NSError
+            typeName = "\(nsError.domain) \(nsError.code)"
+        }
+        // An OpenAPIRuntime error describes the whole response, with its header fields.
+        // Keep only the HTTP status from it.
+        if qualifiedName.hasPrefix("OpenAPIRuntime.") {
+            guard let status = undocumentedStatus(in: String(describing: error)) else {
+                return typeName
+            }
+            return "\(typeName): unexpected HTTP status \(status)"
+        }
+        return "\(typeName): \(error.localizedDescription)"
+    }
+
+    /// Finds the status of an undocumented response, for example
+    /// `undocumented(statusCode: 401, ...)`.
+    private static func undocumentedStatus(in description: String) -> Int? {
+        guard let range = description.range(of: "statusCode: ") else {
+            return nil
+        }
+        let digits = description[range.upperBound...].prefix { $0.isNumber }
+        return Int(digits)
     }
 
     private func provision() async throws -> CertificateProvisioningResponse {

@@ -247,6 +247,10 @@ public struct DeveloperAPIXcodeAuthMiddleware: ClientMiddleware {
     }
 
     private func shouldRetry(_ error: Error) -> Bool {
+        if let omnisetteError = error as? OmnisetteError {
+            return omnisetteError.isTransient
+        }
+
         if let decodingError = error as? DecodingError {
             switch decodingError {
             case .dataCorrupted, .keyNotFound, .typeMismatch, .valueNotFound:

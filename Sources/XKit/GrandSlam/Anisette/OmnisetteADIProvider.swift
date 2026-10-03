@@ -1,6 +1,53 @@
 import Foundation
 import Dependencies
 
+/// A failure of the anisette server.
+///
+/// The messages never contain a reply body, because a successful reply
+/// contains one-time Apple tokens (`X-Apple-I-MD`, `X-Apple-I-MD-M`).
+public enum OmnisetteError: LocalizedError, Sendable {
+    /// The server replied with an HTTP status that is not 2xx.
+    case httpStatus(server: URL, status: Int)
+    /// The reply is not valid JSON, or it does not have the expected fields.
+    /// `status` and `contentType` are nil for a WebSocket message.
+    case invalidReply(server: URL, status: Int?, contentType: String?, isJSON: Bool)
+    /// The server sent a JSON error object.
+    case serverError(server: URL, result: String, message: String?)
+
+    public var errorDescription: String? {
+        switch self {
+        case .httpStatus(let server, let status):
+            return "The anisette server \(server.absoluteString) returned HTTP status \(status)."
+        case .invalidReply(let server, let status, let contentType, _):
+            let source: String
+            if let status {
+                source = "HTTP \(status), content type \(contentType ?? "not set")"
+            } else {
+                source = "WebSocket message"
+            }
+            return "The anisette server \(server.absoluteString) sent a reply that is not anisette data (\(source))."
+        case .serverError(let server, let result, let message):
+            guard let message else {
+                return "The anisette server \(server.absoluteString) reported an error: \(result)."
+            }
+            return "The anisette server \(server.absoluteString) reported an error: \(result): \(message)"
+        }
+    }
+
+    /// True when a second attempt can succeed: a server failure (5xx) or a reply
+    /// that is not JSON. A JSON error object gives the same result again.
+    public var isTransient: Bool {
+        switch self {
+        case .httpStatus(_, let status):
+            return (500...599).contains(status)
+        case .invalidReply(_, _, _, let isJSON):
+            return !isJSON
+        case .serverError:
+            return false
+        }
+    }
+}
+
 struct OmnisetteADIProvider: RawADIProvider {
     @Dependency(\.httpClient) private var client
 
@@ -28,14 +75,79 @@ struct OmnisetteADIProvider: RawADIProvider {
         return encoder
     }()
 
+    /// The `result` and `message` fields that each server reply can have.
+    private struct ReplyHeader: Decodable {
+        let result: String?
+        let message: String?
+    }
+
+    // A server message is diagnostic text. Keep a long one from filling the log.
+    private static let maximumMessageLength = 300
+
+    /// Decodes a reply of the server at `server`. A reply whose `result` is not
+    /// `expectedResult` is a JSON error object. Use a nil `expectedResult` for a
+    /// reply that has no `result` field.
+    /// Each failure becomes an `OmnisetteError`, which does not contain the body.
+    static func decodeReply<T: Decodable>(
+        _ type: T.Type,
+        from body: Data,
+        expectedResult: String?,
+        server: URL,
+        status: Int? = nil,
+        contentType: String? = nil
+    ) throws -> T {
+        let header: ReplyHeader
+        do {
+            header = try decoder.decode(ReplyHeader.self, from: body)
+        } catch {
+            let isJSON = (try? JSONSerialization.jsonObject(with: body, options: .fragmentsAllowed)) != nil
+            throw OmnisetteError.invalidReply(server: server, status: status, contentType: contentType, isJSON: isJSON)
+        }
+        if let result = header.result, result != expectedResult {
+            throw OmnisetteError.serverError(
+                server: server,
+                result: String(result.prefix(maximumMessageLength)),
+                message: header.message.map { String($0.prefix(maximumMessageLength)) }
+            )
+        }
+        guard expectedResult == nil || header.result != nil else {
+            throw OmnisetteError.invalidReply(server: server, status: status, contentType: contentType, isJSON: true)
+        }
+        do {
+            return try decoder.decode(type, from: body)
+        } catch {
+            throw OmnisetteError.invalidReply(server: server, status: status, contentType: contentType, isJSON: true)
+        }
+    }
+
+    /// Checks the HTTP status before it decodes the reply.
+    private func decodeReply<T: Decodable>(
+        _ type: T.Type,
+        response: HTTPResponse,
+        body: Data,
+        expectedResult: String?
+    ) throws -> T {
+        guard response.status.kind == .successful else {
+            throw OmnisetteError.httpStatus(server: url, status: response.status.code)
+        }
+        return try Self.decodeReply(
+            type,
+            from: body,
+            expectedResult: expectedResult,
+            server: url,
+            status: response.status.code,
+            contentType: response.headerFields[.contentType]
+        )
+    }
+
     func clientInfo() async throws -> String {
         struct ClientInfo: Decodable {
             let clientInfo: String
         }
-        let body = try await client.makeRequest(
+        let (response, body) = try await client.makeRequest(
             HTTPRequest(url: url.appendingPathComponent("v3/client_info"))
-        ).body
-        let clientInfo = try Self.decoder.decode(ClientInfo.self, from: body)
+        )
+        let clientInfo = try decodeReply(ClientInfo.self, response: response, body: body, expectedResult: nil)
         return clientInfo.clientInfo
     }
 
@@ -46,7 +158,7 @@ struct OmnisetteADIProvider: RawADIProvider {
         url = components.url!
 
         let task = try await client.makeWebSocket(url: url)
-        let connection = OmnisetteProvisioningSession(task: task)
+        let connection = OmnisetteProvisioningSession(task: task, server: self.url)
         let cpim = try await connection.startProvisioning(spim: spim, userID: userID)
         return (connection, cpim)
     }
@@ -80,8 +192,8 @@ struct OmnisetteADIProvider: RawADIProvider {
             identifier: userID.rawBytes,
             adiPb: provisioningInfo
         ))
-        let response = try await client.makeRequest(request, body: body).body
-        let decoded = try Self.decoder.decode(Response.self, from: response)
+        let (response, responseBody) = try await client.makeRequest(request, body: body)
+        let decoded = try decodeReply(Response.self, response: response, body: responseBody, expectedResult: "Headers")
         if let rinfo = UInt64(decoded.rinfo) {
             routingInfo = rinfo
         }
@@ -91,9 +203,11 @@ struct OmnisetteADIProvider: RawADIProvider {
 
 private final class OmnisetteProvisioningSession: RawADIProvisioningSession {
     let task: WebSocketSession
+    let server: URL
 
-    init(task: WebSocketSession) {
+    init(task: WebSocketSession, server: URL) {
         self.task = task
+        self.server = server
     }
 
     deinit {
@@ -150,10 +264,6 @@ private final class OmnisetteProvisioningSession: RawADIProvisioningSession {
         }
     }
 
-    private struct Header: Decodable {
-        let result: String
-    }
-
     @discardableResult
     private func receive<T: Decodable>(_ message: String, as type: T.Type = EmptyResponse.self) async throws -> T {
         let data = switch try await task.receive() {
@@ -161,14 +271,7 @@ private final class OmnisetteProvisioningSession: RawADIProvisioningSession {
         case .text(let text): Data(text.utf8)
         @unknown default: Data()
         }
-        let header = try OmnisetteADIProvider.decoder.decode(Header.self, from: data)
-        guard header.result == message else {
-            throw DecodingError.dataCorrupted(.init(
-                codingPath: [],
-                debugDescription: "Expected message '\(message)', got \(header.result)"
-            ))
-        }
-        return try OmnisetteADIProvider.decoder.decode(type, from: data)
+        return try OmnisetteADIProvider.decodeReply(type, from: data, expectedResult: message, server: server)
     }
 
     private func send<T: Encodable>(_ message: T) async throws {
