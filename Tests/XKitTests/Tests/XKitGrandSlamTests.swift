@@ -25,11 +25,11 @@ class XKitGrandSlamTests: XCTestCase {
     var storage: KeyValueStorage!
     var client: GrandSlamClient!
 
-    override func setUp() {
-        super.setUp()
+    override func setUpWithError() throws {
+        try super.setUpWithError()
         _ = addMockSigner
         storage = MemoryKeyValueStorage()
-        client = try! .test(storage: storage)
+        client = try .test(storage: storage)
         authenticator = TwoFactorAuthenticator()
     }
 

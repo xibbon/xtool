@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import XCTest
 import XKit
 
 struct Config: Decodable {
@@ -22,11 +23,13 @@ struct Config: Decodable {
     let preferredTeam: String
     let udid: String
 
-    static let current: Config = {
-        let url = Bundle.module.url(forResource: "config", withExtension: "json")!
-        // swiftlint:disable:next force_try
-        let data = try! Data(contentsOf: url)
-        // swiftlint:disable:next force_try
-        return try! JSONDecoder().decode(Config.self, from: data)
-    }()
+    static var current: Config {
+        get throws {
+            guard let url = Bundle.module.url(forResource: "config", withExtension: "json") else {
+                throw XCTSkip("Add Tests/XKitTests/config/config.json to run the integration tests.")
+            }
+            let data = try Data(contentsOf: url)
+            return try JSONDecoder().decode(Config.self, from: data)
+        }
+    }
 }

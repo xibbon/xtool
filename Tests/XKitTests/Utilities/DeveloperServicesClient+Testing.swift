@@ -8,6 +8,7 @@
 
 import Foundation
 import XCTest
+import Dependencies
 @testable import XKit
 
 #if false
@@ -30,21 +31,30 @@ extension NetcatAnisetteDataProvider {
 
 #endif
 
-extension ADIDataProvider {
-
-    static func test(storage: KeyValueStorage) throws -> ADIDataProvider {
-        try adiProvider(deviceInfo: Config.current.deviceInfo, storage: storage)
+private func withIntegrationDependencies<Result>(
+    storage: KeyValueStorage,
+    operation: () -> Result
+) throws -> Result {
+    let config = try Config.current
+    return withDependencies {
+        $0.context = .live
+        $0.keyValueStorage = storage
+        $0.deviceInfoProvider = DeviceInfoProvider { config.deviceInfo }
+    } operation: {
+        withDependencies {
+            $0.anisetteDataProvider = ADIDataProvider()
+        } operation: {
+            operation()
+        }
     }
-
 }
 
 extension GrandSlamClient {
 
     static func test(storage: KeyValueStorage) throws -> GrandSlamClient {
-        try GrandSlamClient(
-            deviceInfo: Config.current.deviceInfo,
-            anisetteProvider: ADIDataProvider.test(storage: storage)
-        )
+        try withIntegrationDependencies(storage: storage) {
+            GrandSlamClient()
+        }
     }
 
 }
@@ -52,11 +62,10 @@ extension GrandSlamClient {
 extension DeveloperServicesClient {
 
     static func test(storage: KeyValueStorage) throws -> DeveloperServicesClient {
-        try DeveloperServicesClient(
-            loginToken: Config.current.appleID.token,
-            deviceInfo: Config.current.deviceInfo,
-            anisetteProvider: ADIDataProvider.test(storage: storage)
-        )
+        let config = try Config.current
+        return try withIntegrationDependencies(storage: storage) {
+            DeveloperServicesClient(loginToken: config.appleID.token)
+        }
     }
 
 }

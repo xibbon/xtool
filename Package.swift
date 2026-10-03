@@ -1,6 +1,16 @@
 // swift-tools-version:6.0
 
 import PackageDescription
+import Foundation
+
+let integrationTestResources: [Resource] = [
+    .copy("config/config-template.json"),
+] + ["config/config.json", "config/test.app"].compactMap { path in
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .appendingPathComponent("Tests/XKitTests/\(path)")
+    return FileManager.default.fileExists(atPath: url.path) ? .copy(path) : nil
+}
 
 let xtoolVersion: String? = {
     if let explicitVersion = Context.environment["XTOOL_VERSION"] {
@@ -167,15 +177,10 @@ let package = Package(
             name: "XKitTests",
             dependencies: [
                 "XKit",
+                .product(name: "Dependencies", package: "swift-dependencies"),
                 .product(name: "SuperutilsTestSupport", package: "xtool-core")
             ],
-            exclude: [
-                "config/config-template.json",
-            ],
-            resources: [
-                .copy("config/config.json"),
-                .copy("config/test.app"),
-            ]
+            resources: integrationTestResources
         ),
         .target(
             name: "XToolSupport",

@@ -18,6 +18,8 @@ When making code changes, please make sure to test them on both macOS and Linux 
 
 To build xtool for debugging, run `make` in the project directory. There are a few considerations depending on your host OS:
 
+Run the tests with `swift test`. The Apple services integration tests are skipped if `Tests/XKitTests/config/config.json` is absent. To run these tests, copy `Tests/XKitTests/config/config-template.json` to `config.json` in the same directory and enter your account and device settings. The provisioning integration test also requires a sample app at `Tests/XKitTests/config/test.app`. These two local files are excluded from Git. The integration tests connect to Apple services and can change provisioning data in your account.
+
 ### macOS
 
 On macOS, you'll firstly need to have Xcode set up.
