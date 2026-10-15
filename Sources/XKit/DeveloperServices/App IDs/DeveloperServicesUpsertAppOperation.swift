@@ -9,6 +9,9 @@ struct DeveloperServicesUpsertAppOperation: Sendable {
     let platform: ProvisioningPlatform
 
     func perform() async throws -> Components.Schemas.BundleId {
+        if context.bundleIdentifierPolicy == .preserveConfigured, originalBundleID != newBundleID {
+            throw CertificateProvisioningError.invalidRequest("The configured bundle identifier \(originalBundleID) must be preserved.")
+        }
         let expectedPlatform = platform.bundleIDPlatform
 
         let pages = DeveloperAPIPages {
@@ -65,6 +68,9 @@ struct DeveloperServicesUpsertAppOperation: Sendable {
             appID = try createResponse.created.body.json.data
         }
 
+        if context.bundleIdentifierPolicy == .preserveConfigured, appID.attributes?.identifier != originalBundleID {
+            throw CertificateProvisioningError.invalidRequest("Apple did not return the configured bundle identifier \(originalBundleID).")
+        }
         let existingCapabilitiesList = try await context.developerAPIClient
             .bundleIdsBundleIdCapabilitiesGetToManyRelated(.init(path: .init(id: appID.id)))
             .ok.body.json.data

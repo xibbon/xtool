@@ -46,7 +46,8 @@ public struct AutoSigner {
         app: URL,
         status: @escaping @Sendable (String) -> Void,
         progress: @escaping @Sendable (Double?) -> Void,
-        didProvision: @escaping () throws -> Void = {}
+        didProvision: @escaping () throws -> Void = {},
+        identityResolved: @escaping @Sendable (String, ProvisioningAssetSource) async -> Void = { _, _ in }
     ) async throws -> String {
         status(NSLocalizedString("signer.provisioning", value: "Provisioning", comment: ""))
         let response = try await DeveloperServicesProvisioningOperation(
@@ -63,6 +64,19 @@ public struct AutoSigner {
             throw Error.errorReading("app bundle ID")
         }
 
+        if context.bundleIdentifierPolicy == .preserveConfigured {
+            for (url, info) in provisioningDict {
+                let platform = ProvisioningPlatform(appBundleURL: url)
+                let relativePath = platform == .macOS ? "Contents/Info.plist" : "Info.plist"
+                let data = try Data(contentsOf: url.appendingPathComponent(relativePath))
+                let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+                guard let configuredID = plist?["CFBundleIdentifier"] as? String, configuredID == info.newBundleID else {
+                    throw CertificateProvisioningError.invalidRequest("The configured bundle identifier changed at \(url.lastPathComponent).")
+                }
+            }
+        }
+        await identityResolved(mainInfo.newBundleID, mainInfo.source)
+        try Task.checkCancellation()
         try didProvision()
 
         for (url, info) in provisioningDict {

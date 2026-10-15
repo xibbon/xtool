@@ -304,6 +304,65 @@ struct CertificateProvisioningTests {
         #expect(Set(free.removedEntitlementKeys) == ["com.example.unknown", "com.apple.security.application-groups"])
     }
 
+    @Test func strictPolicyPreservesConfiguredIdentifiers() throws {
+        let fixture = try Fixture()
+        var context = try fixture.context()
+        context.bundleIdentifierPolicy = .preserveConfigured
+        for identifier in ["com.example.game", "com.example.game.extension", "XTL-OLD.com.example.game"] {
+            #expect(CertificateProvisioningPreparation.mapBundleID(original: identifier, context: context) == identifier)
+        }
+    }
+
+    @Test func strictPolicyRejectsRemappedCertificateNodesBeforeAppleRequests() async throws {
+        let fixture = try Fixture()
+        var context = try fixture.context()
+        context.bundleIdentifierPolicy = .preserveConfigured
+        let service = MockService(resources: [fixture.resource(id: "exact")])
+        let node = CertificateProvisioningNode(relativePath: ".", originalBundleID: "com.example.game",
+            finalBundleID: "XTL-TEAM.com.example.game", requestedEntitlements: try fixture.entitlements([:]))
+        do {
+            _ = try await DeveloperServicesCertificateProvisioningOperation(context: context,
+                certificate: fixture.certificate, nodes: [node], service: service).perform()
+            Issue.record("Strict provisioning accepted a changed bundle ID.")
+        } catch CertificateProvisioningError.invalidRequest(let reason) {
+            #expect(reason.contains("com.example.game"))
+        }
+        #expect(await service.events.isEmpty)
+    }
+
+    @Test func strictProvisioningKeepsExactNestedIDsForFreeAndPaidTeams() async throws {
+        let fixture = try Fixture()
+        var context = try fixture.context()
+        context.bundleIdentifierPolicy = .preserveConfigured
+        for freeTeam in [false, true] {
+            let service = MockService(resources: [fixture.resource(id: "exact")], freeTeam: freeTeam)
+            let nodes = try [fixture.node(path: ".", id: "com.example.game"),
+                fixture.node(path: "PlugIns/Child.appex", id: "com.example.game.child")]
+            let result = try await DeveloperServicesCertificateProvisioningOperation(context: context,
+                certificate: fixture.certificate, nodes: nodes, service: service).perform()
+            #expect(result.nodes.map(\.node.finalBundleID) == ["com.example.game", "com.example.game.child"])
+            #expect(await service.preparedIDs == ["com.example.game", "com.example.game.child"])
+        }
+    }
+
+    @Test func strictAppleRejectionNeverTriesAPrefixedIdentifier() async throws {
+        let fixture = try Fixture()
+        var context = try fixture.context()
+        context.bundleIdentifierPolicy = .preserveConfigured
+        for freeTeam in [false, true] {
+            let service = MockService(resources: [fixture.resource(id: "exact")], freeTeam: freeTeam, rejectApp: true)
+            do {
+                _ = try await DeveloperServicesCertificateProvisioningOperation(context: context,
+                    certificate: fixture.certificate, nodes: [fixture.node(path: ".", id: "com.example.game")], service: service).perform()
+                Issue.record("Apple rejection must stop provisioning.")
+            } catch CertificateProvisioningError.requestFailed(let detail) {
+                #expect(detail?.contains("AppRejected") == true)
+            }
+            #expect(await service.preparedIDs == ["com.example.game"])
+            #expect(await service.events.allSatisfy { !$0.hasPrefix("create:") })
+        }
+    }
+
     @Test func observerCountsActualMiddlewareInvocationsAndRestoresScope() async throws {
         let count = Counter()
         let middleware = DeveloperServicesAPIObservationMiddleware()
@@ -564,6 +623,12 @@ private struct Fixture {
 }
 
 private actor MockService: CertificateProvisioningServing {
+    enum AppRejected: Error {
+        case rejected
+    }
+    let freeTeam: Bool
+    let rejectApp: Bool
+    var preparedIDs: [String] = []
     let resources: [DeveloperServicesCertificate]
     let failWithLimit: Bool
     let cancelDuringPrepare: Bool
@@ -571,7 +636,9 @@ private actor MockService: CertificateProvisioningServing {
     let existingProfile = Data("original profile".utf8)
     var events: [String] = []
 
-    init(resources: [DeveloperServicesCertificate], failWithLimit: Bool = false, cancelDuringPrepare: Bool = false, transientProfileFailures: Int = 0) {
+    init(resources: [DeveloperServicesCertificate], failWithLimit: Bool = false, cancelDuringPrepare: Bool = false, transientProfileFailures: Int = 0, freeTeam: Bool = false, rejectApp: Bool = false) {
+        self.freeTeam = freeTeam
+        self.rejectApp = rejectApp
         self.resources = resources
         self.failWithLimit = failWithLimit
         self.cancelDuringPrepare = cancelDuringPrepare
@@ -580,7 +647,7 @@ private actor MockService: CertificateProvisioningServing {
 
     func team() -> (teamID: String?, isFree: Bool) {
         events.append("team")
-        return ("TEAM", false)
+        return ("TEAM", freeTeam)
     }
 
     func certificates() -> [DeveloperServicesCertificate] {
@@ -594,6 +661,10 @@ private actor MockService: CertificateProvisioningServing {
 
     func prepareApp(_ node: CertificateProvisioningNode) throws -> String {
         events.append("prepare:" + node.relativePath)
+        preparedIDs.append(node.finalBundleID)
+        if rejectApp {
+            throw AppRejected.rejected
+        }
         if cancelDuringPrepare {
             throw CancellationError()
         }

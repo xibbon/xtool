@@ -9,10 +9,17 @@
 import Foundation
 import Dependencies
 
+public enum ProvisioningAssetSource: String, Sendable {
+    case localProfile
+    case cache
+    case provisioning
+}
+
 public struct ProvisioningInfo: Sendable {
     public let newBundleID: String
     public let entitlements: Entitlements
     public let mobileprovision: Mobileprovision
+    public var source: ProvisioningAssetSource = .provisioning
 }
 
 public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation {
@@ -298,7 +305,8 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
             return ProvisioningInfo(
                 newBundleID: newBundleID,
                 entitlements: entitlements,
-                mobileprovision: mobileprovision
+                mobileprovision: mobileprovision,
+                source: candidate.source == .cached ? .cache : .localProfile
             )
         }
         return nil
@@ -367,7 +375,7 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
                 platform: platform,
                 expectedDeviceUDID: expectedUDID
             )
-            for cacheKey in cacheKeys {
+            for cacheKey in cacheKeys where cacheKey.hasPrefix("provisioning-cache/v2/") {
                 try persistProvisioningData(profileData, forKey: cacheKey)
             }
         }
@@ -384,7 +392,9 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
             context: context
         )
 
-        let bundleCandidates = uniqueValues([originalBundleID, sanitizedBundleID, prefixedBundleID])
+        let bundleCandidates = context.bundleIdentifierPolicy == .preserveConfigured
+            ? [originalBundleID]
+            : uniqueValues([originalBundleID, sanitizedBundleID, prefixedBundleID])
 
         var deviceCandidates = ["no-device"]
         if let expectedDeviceUDID, !expectedDeviceUDID.isEmpty {
@@ -404,7 +414,11 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
             }
         }
 
-        return uniqueValues(keys)
+        // Legacy entries are accepted only after the profile claims are checked.
+        let legacy = keys.map { key in
+            key.replacingOccurrences(of: "provisioning-cache/v2/\(context.bundleIdentifierPolicy.rawValue)/", with: "provisioning-cache/v1/")
+        }
+        return uniqueValues(keys + legacy)
     }
 
     private func provisioningCacheKey(
@@ -418,7 +432,7 @@ public struct DeveloperServicesProvisioningOperation: DeveloperServicesOperation
         case .macOS:
             "macos"
         }
-        return "provisioning-cache/v1/\(sanitizeCacheComponent(context.auth.identityID))/\(platformPart)/\(sanitizeCacheComponent(devicePart))/\(sanitizeCacheComponent(originalBundleID))"
+        return "provisioning-cache/v2/\(context.bundleIdentifierPolicy.rawValue)/\(sanitizeCacheComponent(context.auth.identityID))/\(platformPart)/\(sanitizeCacheComponent(devicePart))/\(sanitizeCacheComponent(originalBundleID))"
     }
 
     private func cachedProvisioningData(forKey cacheKey: String) throws -> Data? {

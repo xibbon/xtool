@@ -21,6 +21,12 @@ public struct SigningContext: Sendable {
         }
     }
 
+    public enum BundleIdentifierPolicy: String, Codable, Sendable {
+        case allowChanges
+        case preserveConfigured
+    }
+
+    public var bundleIdentifierPolicy: BundleIdentifierPolicy
     public var auth: DeveloperAPIAuthData
     public var targetDevice: TargetDevice?
     public var signer: Signer
@@ -32,8 +38,10 @@ public struct SigningContext: Sendable {
     public init(
         auth: DeveloperAPIAuthData,
         targetDevice: TargetDevice? = nil,
-        signer: Signer? = nil
+        signer: Signer? = nil,
+        bundleIdentifierPolicy: BundleIdentifierPolicy = .allowChanges
     ) throws {
+        self.bundleIdentifierPolicy = bundleIdentifierPolicy
         self.auth = auth
         self.targetDevice = targetDevice
         self.signer = try signer ?? .first()

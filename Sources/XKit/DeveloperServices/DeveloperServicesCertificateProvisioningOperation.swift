@@ -209,6 +209,9 @@ public struct DeveloperServicesCertificateProvisioningOperation: Sendable {
             throw CertificateProvisioningError.invalidRequest("Specify one device and unique bundle paths and identifiers.")
         }
         for node in nodes {
+            if context.bundleIdentifierPolicy == .preserveConfigured, node.originalBundleID != node.finalBundleID {
+                throw CertificateProvisioningError.invalidRequest("The configured bundle identifier \(node.originalBundleID) must be preserved.")
+            }
             guard !node.originalBundleID.isEmpty,
                   !node.finalBundleID.isEmpty,
                   !node.finalBundleID.contains("*"),
